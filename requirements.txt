@@ -1,0 +1,2 @@
+flask          # If using Flask
+ytmusicapi     # For interacting with YouTube Music
