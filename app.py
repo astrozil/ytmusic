@@ -19,4 +19,4 @@ def get_song(song_id):
     return jsonify(details)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
