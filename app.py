@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify, abort
 from ytmusicapi import YTMusic
 import re
 import requests
-from bs4 import BeautifulSoup
 import logging
 from flask_caching import Cache
 from flask_limiter import Limiter
@@ -33,7 +32,7 @@ def format_genius_url(artist, song_title):
     song_title = re.sub(r"[^\w\s-]", "", song_title).strip().replace(" ", "-")
     return f"https://genius.com/{artist}-{song_title}-lyrics"
 
-# Helper function to scrape lyrics from Genius
+# Helper function to scrape lyrics using regex
 def scrape_lyrics(lyrics_url):
     try:
         headers = {
@@ -47,13 +46,15 @@ def scrape_lyrics(lyrics_url):
             logger.error(f"Failed to fetch lyrics: HTTP {response.status_code}")
             return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        lyrics_divs = soup.find_all("div", attrs={"data-lyrics-container": "true"})
-        if not lyrics_divs:
+        # Use regex to extract lyrics from the HTML response
+        lyrics_pattern = re.compile(r'"lyrics":"(.*?)"', re.DOTALL)
+        match = lyrics_pattern.search(response.text)
+
+        if not match:
             logger.warning("No lyrics found in the page")
             return None
 
-        lyrics = "\n".join([div.get_text(separator="\n") for div in lyrics_divs])
+        lyrics = match.group(1).replace("\\n", "\n").replace("\\", "")
         return lyrics
     except requests.exceptions.RequestException as e:
         logger.error(f"Request error: {e}")
