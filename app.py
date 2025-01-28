@@ -109,6 +109,13 @@ def get_lyrics():
 def health_check():
     return jsonify({"status": "healthy"}), 200
 
+@app.route("/test-genius", methods=["GET"])
+def test_genius():
+    try:
+        response = requests.get("https://genius.com", timeout=10)
+        return jsonify({"status": "success", "status_code": response.status_code})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 # Error handler for 404
 @app.errorhandler(404)
 def not_found(error):
