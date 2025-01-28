@@ -61,4 +61,4 @@ def get_lyrics():
     return jsonify({"song_title": song_title, "artist": artist_name, "lyrics": lyrics})
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=5000)
