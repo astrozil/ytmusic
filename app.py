@@ -28,25 +28,38 @@ ytmusic = YTMusic(oauth_file)
 
 # Helper function to format Genius URL
 def format_genius_url(artist, song_title):
-    artist = re.sub(r"[^\w\s]", "", artist)  # Remove special characters
-    song_title = re.sub(r"[^\w\s]", "", song_title)  # Remove special characters
-    artist = artist.replace(" ", "-").lower()
-    song_title = song_title.replace(" ", "-").lower()
+    # Remove special characters and normalize spaces
+    artist = re.sub(r"[^\w\s-]", "", artist).strip().replace(" ", "-")
+    song_title = re.sub(r"[^\w\s-]", "", song_title).strip().replace(" ", "-")
     return f"https://genius.com/{artist}-{song_title}-lyrics"
 
 # Helper function to scrape lyrics from Genius
 def scrape_lyrics(lyrics_url):
     try:
-        response = requests.get(lyrics_url)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        logger.info(f"Fetching lyrics from: {lyrics_url}")
+        response = requests.get(lyrics_url, headers=headers, timeout=10)
+        logger.info(f"Response status code: {response.status_code}")
+
         if response.status_code != 200:
+            logger.error(f"Failed to fetch lyrics: HTTP {response.status_code}")
             return None
 
         soup = BeautifulSoup(response.text, "html.parser")
         lyrics_divs = soup.find_all("div", attrs={"data-lyrics-container": "true"})
+        if not lyrics_divs:
+            logger.warning("No lyrics found in the page")
+            return None
+
         lyrics = "\n".join([div.get_text(separator="\n") for div in lyrics_divs])
         return lyrics
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Error scraping lyrics: {e}")
+        logger.error(f"Unexpected error: {e}")
         return None
 
 # Search endpoint
@@ -91,31 +104,32 @@ def get_lyrics():
     if not song_title or not artist_name or not isinstance(song_title, str) or not isinstance(artist_name, str):
         abort(400, description="Title and artist parameters are required and must be strings")
 
-    try:
-        lyrics_url = format_genius_url(artist_name, song_title)
-        lyrics = scrape_lyrics(lyrics_url)
+    # Try Genius first
+    lyrics_url = format_genius_url(artist_name, song_title)
+    lyrics = scrape_lyrics(lyrics_url)
 
-        if not lyrics:
-            logger.warning(f"Lyrics not found for {song_title} by {artist_name}")
-            abort(404, description="Lyrics not found")
+    if not lyrics:
+        # Fallback to Lyrics.ovh
+        fallback_url = f"https://api.lyrics.ovh/v1/{artist_name}/{song_title}"
+        try:
+            response = requests.get(fallback_url, timeout=10)
+            if response.status_code == 200:
+                lyrics = response.json().get("lyrics")
+                logger.info(f"Fallback lyrics found for {song_title} by {artist_name}")
+        except Exception as e:
+            logger.error(f"Fallback error: {e}")
 
-        return jsonify({"song_title": song_title, "artist": artist_name, "lyrics": lyrics})
-    except Exception as e:
-        logger.error(f"Error fetching lyrics: {e}")
-        abort(500, description="An error occurred while processing your request")
+    if not lyrics:
+        logger.warning(f"Lyrics not found for {song_title} by {artist_name}")
+        abort(404, description="Lyrics not found on Genius or fallback service")
+
+    return jsonify({"song_title": song_title, "artist": artist_name, "lyrics": lyrics})
 
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy"}), 200
 
-@app.route("/test-genius", methods=["GET"])
-def test_genius():
-    try:
-        response = requests.get("https://genius.com", timeout=10)
-        return jsonify({"status": "success", "status_code": response.status_code})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
 # Error handler for 404
 @app.errorhandler(404)
 def not_found(error):
