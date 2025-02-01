@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 # Initialize YTMusic API
-oauth_file = os.getenv("OAUTH_FILE", "oauth.json")  # Use environment variable for oauth file
-ytmusic = YTMusic(oauth_file)
+ # Use environment variable for oauth file
+ytmusic = YTMusic("oauth.json")
 
 # Helper function to format Genius URL
 def format_genius_url(artist, song_title):
