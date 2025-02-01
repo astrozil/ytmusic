@@ -4,7 +4,8 @@ import os
 
 app = Flask(__name__)
 oauth_file_path = os.getenv("O_Auth", "./oauth.json")
-
+if not os.path.exists(oauth_file_path):
+    raise FileNotFoundError(f"OAuth file not found at: {oauth_file_path}")
 # Initialize the API
 ytmusic = YTMusic(oauth_file_path)
 
