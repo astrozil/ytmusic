@@ -2,19 +2,10 @@ from flask import Flask, request, jsonify, abort
 from ytmusicapi import YTMusic
 import re
 import requests
-import logging
-import os
+
 
 # Initialize Flask app
 app = Flask(__name__)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-# Initialize YTMusic API
- # Use environment variable for oauth file
 ytmusic = YTMusic("oauth.json")
 
 # Helper function to format Genius URL
