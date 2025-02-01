@@ -4,15 +4,8 @@ import os
 import json
 
 app = Flask(__name__)
-oauth_credentials = os.getenv("O_Auth")
-if not oauth_credentials:
-    raise ValueError("OAuth credentials not found in environment variables.")
 
-# Parse the credentials
-credentials = json.loads(oauth_credentials)
-
-# Initialize the API
-ytmusic = YTMusic(auth=credentials)
+ytmusic = YTMusic("oauth.json")
 
 @app.route("/search", methods=["GET"])
 def search():
