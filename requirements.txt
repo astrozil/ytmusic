@@ -1,5 +1,2 @@
 flask          # If using Flask
 ytmusicapi     # For interacting with YouTube Music
-          # For lyrics
-flask_caching
-flask_limiter
