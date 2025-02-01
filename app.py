@@ -2,11 +2,28 @@ from flask import Flask, request, jsonify, abort
 from ytmusicapi import YTMusic
 import re
 import requests
-
+import logging
+from flask_caching import Cache
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import os
 
 # Initialize Flask app
 app = Flask(__name__)
-ytmusic = YTMusic("oauth.json")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configure caching
+cache = Cache(app, config={"CACHE_TYPE": "simple"})
+
+# Configure rate limiting
+limiter = Limiter(app=app, key_func=get_remote_address, default_limits=["200 per day", "50 per hour"])
+
+# Initialize YTMusic API
+oauth_file = os.getenv("OAUTH_FILE", "oauth.json")  # Use environment variable for oauth file
+ytmusic = YTMusic(oauth_file)
 
 # Helper function to format Genius URL
 def format_genius_url(artist, song_title):
@@ -48,7 +65,8 @@ def scrape_lyrics(lyrics_url):
 
 # Search endpoint
 @app.route("/search", methods=["GET"])
-
+@limiter.limit("10 per minute")  # Rate limit
+@cache.cached(timeout=60)  # Cache results for 60 seconds
 def search():
     query = request.args.get("query")
     if not query or not isinstance(query, str):
@@ -63,7 +81,8 @@ def search():
 
 # Song details endpoint
 @app.route("/song/<song_id>", methods=["GET"])
-
+@limiter.limit("10 per minute")  # Rate limit
+@cache.cached(timeout=60)  # Cache results for 60 seconds
 def get_song(song_id):
     if not song_id or not isinstance(song_id, str):
         abort(400, description="Song ID is required and must be a string")
@@ -77,7 +96,8 @@ def get_song(song_id):
 
 # Lyrics endpoint
 @app.route("/lyrics", methods=["GET"])
-
+@limiter.limit("10 per minute")  # Rate limit
+@cache.cached(timeout=60)  # Cache results for 60 seconds
 def get_lyrics():
     song_title = request.args.get("title")
     artist_name = request.args.get("artist")
