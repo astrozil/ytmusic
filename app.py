@@ -1,8 +1,12 @@
 from flask import Flask, request, jsonify
 from ytmusicapi import YTMusic
+import os
 
 app = Flask(__name__)
-ytmusic = YTMusic("./oauth.json")
+oauth_file_path = os.getenv("O_Auth", "./oauth.json")
+
+# Initialize the API
+ytmusic = YTMusic(oauth_file_path)
 
 @app.route("/search", methods=["GET"])
 def search():
