@@ -1,13 +1,18 @@
 from flask import Flask, request, jsonify
 from ytmusicapi import YTMusic
 import os
+import json
 
 app = Flask(__name__)
-oauth_file_path = os.getenv("O_Auth", "./oauth.json")
-if not os.path.exists(oauth_file_path):
-    raise FileNotFoundError(f"OAuth file not found at: {oauth_file_path}")
+oauth_credentials = os.getenv("O_Auth")
+if not oauth_credentials:
+    raise ValueError("OAuth credentials not found in environment variables.")
+
+# Parse the credentials
+credentials = json.loads(oauth_credentials)
+
 # Initialize the API
-ytmusic = YTMusic(oauth_file_path)
+ytmusic = YTMusic(auth=credentials)
 
 @app.route("/search", methods=["GET"])
 def search():
