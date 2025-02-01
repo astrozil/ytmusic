@@ -5,7 +5,7 @@ import json
 
 app = Flask(__name__)
 
-ytmusic = YTMusic("auth/oauth.json")
+ytmusic = YTMusic("browser.json")
 
 @app.route("/search", methods=["GET"])
 def search():
