@@ -1,5 +1,5 @@
 flask          # If using Flask
 ytmusicapi     # For interacting with YouTube Music
-          # For lyrics
+beautifulsoup4    # For lyrics
 flask_caching
 flask_limiter
