@@ -1,5 +1,3 @@
-
-
 from flask import Flask, request, jsonify, abort
 from ytmusicapi import YTMusic
 import re
@@ -14,13 +12,10 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-
 ytmusic = YTMusic("browser.json")
 
 # Helper function to format Genius URL
 def format_genius_url(artist, song_title):
-    # Remove special characters and normalize spaces
     artist = re.sub(r"[^\w\s-]", "", artist).strip().replace(" ", "-")
     song_title = re.sub(r"[^\w\s-]", "", song_title).strip().replace(" ", "-")
     return f"https://genius.com/{artist}-{song_title}-lyrics"
@@ -39,7 +34,6 @@ def scrape_lyrics(lyrics_url):
             logger.error(f"Failed to fetch lyrics: HTTP {response.status_code}")
             return None
 
-        # Use regex to extract lyrics from the HTML response
         lyrics_pattern = re.compile(r'"lyrics":"(.*?)"', re.DOTALL)
         match = lyrics_pattern.search(response.text)
 
@@ -58,7 +52,6 @@ def scrape_lyrics(lyrics_url):
 
 # Search endpoint
 @app.route("/search", methods=["GET"])
-
 def search():
     query = request.args.get("query")
     if not query or not isinstance(query, str):
@@ -73,7 +66,6 @@ def search():
 
 # Song details endpoint
 @app.route("/song/<song_id>", methods=["GET"])
-
 def get_song(song_id):
     if not song_id or not isinstance(song_id, str):
         abort(400, description="Song ID is required and must be a string")
@@ -87,7 +79,6 @@ def get_song(song_id):
 
 # Lyrics endpoint
 @app.route("/lyrics", methods=["GET"])
-
 def get_lyrics():
     song_title = request.args.get("title")
     artist_name = request.args.get("artist")
@@ -95,12 +86,10 @@ def get_lyrics():
     if not song_title or not artist_name or not isinstance(song_title, str) or not isinstance(artist_name, str):
         abort(400, description="Title and artist parameters are required and must be strings")
 
-    # Try Genius first
     lyrics_url = format_genius_url(artist_name, song_title)
     lyrics = scrape_lyrics(lyrics_url)
 
     if not lyrics:
-        # Fallback to Lyrics.ovh
         fallback_url = f"https://api.lyrics.ovh/v1/{artist_name}/{song_title}"
         try:
             response = requests.get(fallback_url, timeout=10)
@@ -116,22 +105,34 @@ def get_lyrics():
 
     return jsonify({"song_title": song_title, "artist": artist_name, "lyrics": lyrics})
 
+# Related songs endpoint
+@app.route("/related/<song_id>", methods=["GET"])
+def get_related_songs(song_id):
+    if not song_id or not isinstance(song_id, str):
+        abort(400, description="Song ID is required and must be a string")
+
+    try:
+        watch_playlist = ytmusic.get_watch_playlist(song_id)
+        related_songs = watch_playlist.get("tracks", [])
+        return jsonify(related_songs)
+    except Exception as e:
+        logger.error(f"Error fetching related songs: {e}")
+        abort(500, description="An error occurred while processing your request")
+
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy"}), 200
 
-# Error handler for 404
+# Error handlers
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": str(error)}), 404
 
-# Error handler for 400
 @app.errorhandler(400)
 def bad_request(error):
     return jsonify({"error": str(error)}), 400
 
-# Error handler for 500
 @app.errorhandler(500)
 def internal_error(error):
     return jsonify({"error": str(error)}), 500
@@ -139,5 +140,3 @@ def internal_error(error):
 # Run the app
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
-
