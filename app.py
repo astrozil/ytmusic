@@ -119,7 +119,18 @@ def get_related_songs(song_id):
     except Exception as e:
         logger.error(f"Error fetching related songs: {e}")
         abort(500, description="An error occurred while processing your request")
+# album endpoint
+@app.route("/album/<album_id>", methods=["GET"])
+def get_album_details(album_id):
+    if not album_id or not isinstance(album_id, str):
+        abort(400, description="Album ID is required and must be a string")
 
+    try:
+        details = ytmusic.get_album(album_id)
+        return jsonify(details)
+    except Exception as e:
+        logger.error(f"Error fetching album details: {e}")
+        abort(500, description="An error occurred while processing your request")
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
