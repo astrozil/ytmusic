@@ -54,11 +54,12 @@ def scrape_lyrics(lyrics_url):
 @app.route("/search", methods=["GET"])
 def search():
     query = request.args.get("query")
+    filter = request.args.get("filter")
     if not query or not isinstance(query, str):
         abort(400, description="Query parameter is required and must be a string")
 
     try:
-        results = ytmusic.search(query)
+        results = ytmusic.search(query,filter)
         return jsonify(results)
     except Exception as e:
         logger.error(f"Error searching YTMusic: {e}")
