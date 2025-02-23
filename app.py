@@ -5,10 +5,10 @@ import requests
 import logging
 import os
 
-# Initialize Flask app
+
 app = Flask(__name__)
 
-# Configure logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,19 @@ def get_album_details(album_id):
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy"}), 200
+# Artist details endpoint
+@app.route("/artist/<artist_id>", methods=["GET"])
+def get_artist_details(artist_id):
+    if not artist_id or not isinstance(artist_id, str):
+        abort(400, description="Artist ID is required and must be a string")
+    
+    try:
+        
+        details = ytmusic.get_artist(artist_id)
+        return jsonify(details)
+    except Exception as e:
+        logger.error(f"Error fetching artist details: {e}")
+        abort(500, description="An error occurred while processing your request")
 
 # Error handlers
 @app.errorhandler(404)
