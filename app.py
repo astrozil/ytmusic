@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, abort
 from ytmusicapi import YTMusic
+import billboard
 import re
 import requests
 import logging
@@ -132,6 +133,125 @@ def get_artist_details(artist_id):
     except Exception as e:
         logger.error(f"Error fetching artist details: {e}")
         abort(500, description="An error occurred while processing your request")
+@app.route("/artist/<artist_id>/songs", methods=["GET"])
+def get_artist_songs(artist_id):
+    if not artist_id or not isinstance(artist_id, str):
+        abort(400, description="Artist ID is required and must be a string")
+    
+    try:
+        artist_details = ytmusic.get_artist(artist_id)
+        all_songs = []
+        
+        # Process different release sections (albums, singles, etc.)
+        for section in artist_details.get('sections', []):
+            section_title = section.get('title', '').lower()
+            
+            # Handle different types of releases
+            if any(keyword in section_title for keyword in ['album', 'single', 'ep', 'compilation']):
+                for item in section.get('items', []):
+                    album_id = item.get('browseId')
+                    if album_id:
+                        try:
+                            album_details = ytmusic.get_album(album_id)
+                            # Extract relevant track information
+                            for track in album_details.get('tracks', []):
+                                simplified_track = {
+                                    "title": track.get('title'),
+                                    "videoId": track.get('videoId'),
+                                    "artist": track.get('artists')[0].get('name') if track.get('artists') else None,
+                                    "album": album_details.get('title'),
+                                    "duration": track.get('duration'),
+                                    "year": album_details.get('year')
+                                }
+                                all_songs.append(simplified_track)
+                        except Exception as e:
+                            logger.error(f"Error processing album {album_id}: {e}")
+                            continue
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_songs = []
+        for song in all_songs:
+            identifier = song.get('videoId') or song.get('title')
+            if identifier and identifier not in seen:
+                seen.add(identifier)
+                unique_songs.append(song)
+
+        return jsonify(unique_songs)
+
+    except Exception as e:
+        logger.error(f"Error fetching artist songs: {e}")
+        abort(500, description="An error occurred while processing your request")
+# Trending songs endpoint
+@app.route("/trending", methods=["GET"])
+def trending_songs():
+    country = request.args.get("country", "US")
+    limit_param = request.args.get("limit", "10")
+    try:
+        limit = int(limit_param)
+    except ValueError:
+        limit = 10
+
+    try:
+        # Retrieve the charts data (which contains trending videos)
+        charts = ytmusic.get_charts(country=country)
+        # Get the trending video items (limit the list)
+        trending_video_items = charts.get("videos", {}).get("items", [])[:limit]
+        trending_songs = []
+
+        # For each trending video, build a search query to find the corresponding song.
+        for video in trending_video_items:
+            title = video.get("title", "")
+            # Use the first artist from the video result (if available)
+            artists = video.get("artists", [])
+            artist_name = artists[0].get("name") if artists else ""
+            query = f"{title} {artist_name}".strip()
+            
+            # Search for the song with filter set to "songs"
+            search_results = ytmusic.search(query, filter="songs")
+            if search_results:
+                # Optionally, you might do additional matching to verify title/artist similarity.
+                trending_songs.append(search_results[0])
+            else:
+                # If no song match is found, you can either skip or use the video as fallback.
+                trending_songs.append(video)
+        
+        return jsonify(trending_songs)
+    except Exception as e:
+        logger.error(f"Error fetching trending songs: {e}")
+        abort(500, description="An error occurred while fetching trending songs")
+# Billboard songs endpoint
+@app.route("/billboard", methods=["GET"])
+def billboard_songs():
+    limit_param = request.args.get("limit", "10")
+    try:
+        limit = int(limit_param)
+    except ValueError:
+        limit = 10
+
+    try:
+        # Fetch Billboard Hot 100 chart data
+        chart = billboard.ChartData('hot-100')
+        entries = []
+        for entry in chart[:limit]:
+            # Build search query using the song title and artist from Billboard
+            query = f"{entry.title} {entry.artist}"
+            results = ytmusic.search(query, filter="songs")
+            best_match = results[0] if results else {}
+            entry_data = {
+                "rank": entry.rank,
+                "title": entry.title,
+                "artist": entry.artist,
+                "lastPos": entry.lastPos,
+                "peakPos": entry.peakPos,
+                "weeks": entry.weeks,
+                "ytmusic_result": best_match  
+            }
+            entries.append(entry_data)
+        return jsonify(entries)
+    except Exception as e:
+        logger.error(f"Error fetching Billboard songs: {e}")
+        abort(500, description="An error occurred while fetching Billboard songs")
 
 # album endpoint
 @app.route("/album/<album_id>", methods=["GET"])
