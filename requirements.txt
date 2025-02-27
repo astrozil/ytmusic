@@ -3,3 +3,4 @@ ytmusicapi     # For interacting with YouTube Music
 beautifulsoup4    # For lyrics
 flask_caching
 flask_limiter
+billboard.py
