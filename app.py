@@ -4,6 +4,7 @@ import billboard
 import re
 import requests
 import logging
+import concurrent.futures
 import os
 
 
@@ -183,41 +184,32 @@ def get_artist_songs(artist_id):
         logger.error(f"Error fetching artist songs: {e}")
         abort(500, description="An error occurred while processing your request")
 # Trending songs endpoint
+
+
+def fetch_song(video):
+    title = video.get("title", "")
+    artists = video.get("artists", [])
+    artist_name = artists[0].get("name") if artists else ""
+    query = f"{title} {artist_name}".strip()
+    search_results = ytmusic.search(query, filter="songs")
+    return search_results[0] if search_results else video
+
 @app.route("/trending", methods=["GET"])
 def trending_songs():
     country = request.args.get("country", "US")
-    limit_param = request.args.get("limit", "30")
-    offset_param = request.args.get("offset", "0")  # New offset parameter
-
+    limit_param = request.args.get("limit", "50")
     try:
         limit = int(limit_param)
     except ValueError:
-        limit = 30
+        limit = 50
 
     try:
-        offset = int(offset_param)
-    except ValueError:
-        offset = 0
-
-    try:
-        # Retrieve the charts data (which contains trending videos)
         charts = ytmusic.get_charts(country=country)
-        # Slice the trending video items using offset and limit
-        all_items = charts.get("videos", {}).get("items", [])
-        trending_video_items = all_items[offset:offset+limit]
-        trending_songs = []
-
-        # Build song list (using search to find the song match)
-        for video in trending_video_items:
-            title = video.get("title", "")
-            artists = video.get("artists", [])
-            artist_name = artists[0].get("name") if artists else ""
-            query = f"{title} {artist_name}".strip()
-            search_results = ytmusic.search(query, filter="songs")
-            if search_results:
-                trending_songs.append(search_results[0])
-            else:
-                trending_songs.append(video)
+        trending_video_items = charts.get("videos", {}).get("items", [])[:limit]
+        
+        # Use a thread pool to search for songs concurrently.
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            trending_songs = list(executor.map(fetch_song, trending_video_items))
         
         return jsonify(trending_songs)
     except Exception as e:
