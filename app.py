@@ -186,17 +186,12 @@ def get_artist_songs(artist_id):
 @app.route("/trending", methods=["GET"])
 def trending_songs():
     country = request.args.get("country", "US")
-    limit_param = request.args.get("limit", "10")
-    try:
-        limit = int(limit_param)
-    except ValueError:
-        limit = 10
-
+    
     try:
         # Retrieve the charts data (which contains trending videos)
         charts = ytmusic.get_charts(country=country)
         # Get the trending video items (limit the list)
-        trending_video_items = charts.get("videos", {}).get("items", [])[:limit]
+        trending_video_items = charts.get("videos", {}).get("items", [])
         trending_songs = []
 
         # For each trending video, build a search query to find the corresponding song.
@@ -223,17 +218,12 @@ def trending_songs():
 # Billboard songs endpoint
 @app.route("/billboard", methods=["GET"])
 def billboard_songs():
-    limit_param = request.args.get("limit", "10")
-    try:
-        limit = int(limit_param)
-    except ValueError:
-        limit = 10
-
+   
     try:
         # Fetch Billboard Hot 100 chart data
         chart = billboard.ChartData('hot-100')
         entries = []
-        for entry in chart[:limit]:
+        for entry in chart:
             # Build search query using the song title and artist from Billboard
             query = f"{entry.title} {entry.artist}"
             results = ytmusic.search(query, filter="songs")
