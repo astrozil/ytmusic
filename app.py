@@ -186,44 +186,58 @@ def get_artist_songs(artist_id):
 @app.route("/trending", methods=["GET"])
 def trending_songs():
     country = request.args.get("country", "US")
-    
+    limit_param = request.args.get("limit", "30")
+    offset_param = request.args.get("offset", "0")  # New offset parameter
+
+    try:
+        limit = int(limit_param)
+    except ValueError:
+        limit = 30
+
+    try:
+        offset = int(offset_param)
+    except ValueError:
+        offset = 0
+
     try:
         # Retrieve the charts data (which contains trending videos)
         charts = ytmusic.get_charts(country=country)
-        # Get the trending video items (limit the list)
-        trending_video_items = charts.get("videos", {}).get("items", [])
+        # Slice the trending video items using offset and limit
+        all_items = charts.get("videos", {}).get("items", [])
+        trending_video_items = all_items[offset:offset+limit]
         trending_songs = []
 
-        # For each trending video, build a search query to find the corresponding song.
+        # Build song list (using search to find the song match)
         for video in trending_video_items:
             title = video.get("title", "")
-            # Use the first artist from the video result (if available)
             artists = video.get("artists", [])
             artist_name = artists[0].get("name") if artists else ""
             query = f"{title} {artist_name}".strip()
-            
-            # Search for the song with filter set to "songs"
             search_results = ytmusic.search(query, filter="songs")
             if search_results:
-                # Optionally, you might do additional matching to verify title/artist similarity.
                 trending_songs.append(search_results[0])
             else:
-                # If no song match is found, you can either skip or use the video as fallback.
                 trending_songs.append(video)
         
         return jsonify(trending_songs)
     except Exception as e:
         logger.error(f"Error fetching trending songs: {e}")
         abort(500, description="An error occurred while fetching trending songs")
+
 # Billboard songs endpoint
 @app.route("/billboard", methods=["GET"])
 def billboard_songs():
-   
+    limit_param = request.args.get("limit", "10")
+    try:
+        limit = int(limit_param)
+    except ValueError:
+        limit = 10
+
     try:
         # Fetch Billboard Hot 100 chart data
         chart = billboard.ChartData('hot-100')
         entries = []
-        for entry in chart:
+        for entry in chart[:limit]:
             # Build search query using the song title and artist from Billboard
             query = f"{entry.title} {entry.artist}"
             results = ytmusic.search(query, filter="songs")
