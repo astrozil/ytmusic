@@ -1,4 +1,4 @@
-flask-async        # If using Flask
+flask[async]        # If using Flask
 ytmusicapi     # For interacting with YouTube Music
 beautifulsoup4    # For lyrics
 flask_caching
