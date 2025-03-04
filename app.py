@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify, abort
 from ytmusicapi import YTMusic
+from flask_caching import Cache
 import billboard
+import asyncio 
 import re
 import requests
 import logging
@@ -9,7 +11,18 @@ import os
 
 
 app = Flask(__name__)
+original_get = requests.get
 
+def patched_get(url, *args, **kwargs):
+    headers = kwargs.get("headers", {})
+    # If there's no User-Agent, add one that mimics a browser.
+    if "User-Agent" not in headers:
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    kwargs["headers"] = headers
+    return original_get(url, *args, **kwargs)
+
+# Patch requests.get globally
+requests.get = patched_get
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,11 +70,12 @@ def scrape_lyrics(lyrics_url):
 def search():
     query = request.args.get("query")
     filter = request.args.get("filter")
+   
     if not query or not isinstance(query, str):
         abort(400, description="Query parameter is required and must be a string")
 
     try:
-        results = ytmusic.search(query,filter)
+        results = ytmusic.search(query,filter,)
         return jsonify(results)
     except Exception as e:
         logger.error(f"Error searching YTMusic: {e}")
@@ -217,37 +231,56 @@ def trending_songs():
         abort(500, description="An error occurred while fetching trending songs")
 
 # Billboard songs endpoint
+
+async def async_fetch_billboard_song(entry):
+    query = f"{entry.title} {entry.artist}"
+    # Wrap the blocking ytmusic.search call so it can run concurrently.
+    results = await asyncio.to_thread(ytmusic.search, query, filter="songs")
+    best_match = results[0] if results else {}
+    return {
+        "rank": entry.rank,
+        "title": entry.title,
+        "artist": entry.artist,
+        "lastPos": entry.lastPos,
+        "peakPos": entry.peakPos,
+        "weeks": entry.weeks,
+        "ytmusic_result": best_match  
+    }
+# Configure caching (simple in-memory cache for demonstration)
+cache = Cache(app, config={'CACHE_TYPE': 'simple'})
 @app.route("/billboard", methods=["GET"])
-def billboard_songs():
+async def billboard_songs():
+    # Get pagination parameters with defaults (e.g., 10 songs per page)
     limit_param = request.args.get("limit", "10")
+    offset_param = request.args.get("offset", "0")
     try:
         limit = int(limit_param)
+        offset = int(offset_param)
     except ValueError:
         limit = 10
+        offset = 0
 
+    # Create a unique cache key based on the limit and offset.
+    cache_key = f"billboard_{offset}_{limit}"
+    cached_entries = cache.get(cache_key)
+    if cached_entries:
+        return jsonify(cached_entries)
+    
     try:
-        # Fetch Billboard Hot 100 chart data
-        chart = billboard.ChartData('hot-100')
-        entries = []
-        for entry in chart[:limit]:
-            # Build search query using the song title and artist from Billboard
-            query = f"{entry.title} {entry.artist}"
-            results = ytmusic.search(query, filter="songs")
-            best_match = results[0] if results else {}
-            entry_data = {
-                "rank": entry.rank,
-                "title": entry.title,
-                "artist": entry.artist,
-                "lastPos": entry.lastPos,
-                "peakPos": entry.peakPos,
-                "weeks": entry.weeks,
-                "ytmusic_result": best_match  
-            }
-            entries.append(entry_data)
+        # Fetch the full Billboard chart data once.
+        chart = await asyncio.to_thread(billboard.ChartData, 'hot-100')
+        # Slice the chart based on pagination parameters.
+        chart_subset = chart[offset:offset + limit]
+        # Create asynchronous tasks for each song in the subset.
+        tasks = [async_fetch_billboard_song(entry) for entry in chart_subset]
+        entries = await asyncio.gather(*tasks)
+        # Cache the result for 60 seconds.
+        cache.set(cache_key, entries, timeout=60)
         return jsonify(entries)
     except Exception as e:
         logger.error(f"Error fetching Billboard songs: {e}")
         abort(500, description="An error occurred while fetching Billboard songs")
+
 
 # album endpoint
 @app.route("/album/<album_id>", methods=["GET"])
