@@ -251,13 +251,13 @@ cache = Cache(app, config={'CACHE_TYPE': 'simple'})
 @app.route("/billboard", methods=["GET"])
 async def billboard_songs():
     # Get pagination parameters with defaults (e.g., 10 songs per page)
-    limit_param = request.args.get("limit", "10")
+    limit_param = request.args.get("limit", "100")
     offset_param = request.args.get("offset", "0")
     try:
         limit = int(limit_param)
         offset = int(offset_param)
     except ValueError:
-        limit = 10
+        limit = 100
         offset = 0
 
     # Create a unique cache key based on the limit and offset.
@@ -275,7 +275,7 @@ async def billboard_songs():
         tasks = [async_fetch_billboard_song(entry) for entry in chart_subset]
         entries = await asyncio.gather(*tasks)
         # Cache the result for 60 seconds.
-        cache.set(cache_key, entries, timeout=1000)
+        cache.set(cache_key, entries, timeout=3600)
         return jsonify(entries)
     except Exception as e:
         logger.error(f"Error fetching Billboard songs: {e}")
