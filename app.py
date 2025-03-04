@@ -275,7 +275,7 @@ async def billboard_songs():
         tasks = [async_fetch_billboard_song(entry) for entry in chart_subset]
         entries = await asyncio.gather(*tasks)
         # Cache the result for 60 seconds.
-        cache.set(cache_key, entries, timeout=60)
+        cache.set(cache_key, entries, timeout=1000)
         return jsonify(entries)
     except Exception as e:
         logger.error(f"Error fetching Billboard songs: {e}")
