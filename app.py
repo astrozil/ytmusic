@@ -8,6 +8,9 @@ import requests
 import logging
 import concurrent.futures
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
+
 
 
 app = Flask(__name__)
@@ -267,14 +270,14 @@ async def billboard_songs():
         return jsonify(cached_entries)
     
     try:
-        # Fetch the full Billboard chart data once.
+     
         chart = await asyncio.to_thread(billboard.ChartData, 'hot-100')
-        # Slice the chart based on pagination parameters.
+      
         chart_subset = chart[offset:offset + limit]
-        # Create asynchronous tasks for each song in the subset.
+  
         tasks = [async_fetch_billboard_song(entry) for entry in chart_subset]
         entries = await asyncio.gather(*tasks)
-        # Cache the result for 60 seconds.
+       
         cache.set(cache_key, entries, timeout=3600)
         return jsonify(entries)
     except Exception as e:
@@ -294,6 +297,113 @@ def get_album_details(album_id):
     except Exception as e:
         logger.error(f"Error fetching album details: {e}")
         abort(500, description="An error occurred while processing your request")
+def format_thumbnails(thumbnails):
+    """
+    Format a list of thumbnails to include only height, url, and width.
+    """
+    if not thumbnails:
+        return []
+    formatted = []
+    for thumb in thumbnails:
+        formatted.append({
+            "height": thumb.get("height"),
+            "width": thumb.get("width"),
+            "url": thumb.get("url")
+        })
+    return formatted
+
+@app.route("/mix", methods=["GET"])
+def mix_songs():
+    artist_ids_param = request.args.get("artists")
+    if not artist_ids_param:
+        abort(400, description="artists parameter is required (comma-separated artist IDs)")
+    
+    artist_ids = [x.strip() for x in artist_ids_param.split(",")]
+    all_songs = []
+
+    for artist_id in artist_ids:
+        try:
+            # Get artist information including top releases.
+            artist_info = ytmusic.get_artist(artist_id)
+        except Exception as e:
+            logger.error(f"Error retrieving artist {artist_id}: {e}")
+            continue
+        
+        # Handle 'songs' key: these are the artist's top songs/videos.
+        if "songs" in artist_info:
+            songs_data = artist_info["songs"]
+            songs_browse_id = songs_data.get("browseId")
+            if songs_browse_id:
+                try:
+                    playlist_data = ytmusic.get_playlist(songs_browse_id)
+                    for track in playlist_data.get("tracks", []):
+                        raw_thumbnails = track.get("thumbnails")
+                        all_songs.append({
+                            "title": track.get("title"),
+                            "videoId": track.get("videoId"),
+                            "artist": track.get("artists", [{}])[0].get("name"),
+                            "album": None,  # Album info might not be provided here.
+                            "duration": track.get("duration"),
+                            "thumbnails": format_thumbnails(raw_thumbnails)
+                        })
+                except Exception as e:
+                    logger.error(f"Error fetching playlist for songs from artist {artist_id}: {e}")
+            else:
+                # Fallback: use the top results directly.
+                for song in songs_data.get("results", []):
+                    raw_thumbnails = song.get("thumbnails")
+                    all_songs.append({
+                        "title": song.get("title"),
+                        "videoId": song.get("videoId"),
+                        "artist": song.get("artist"),
+                        "album": song.get("album"),
+                        "duration": song.get("duration"),
+                        "thumbnails": format_thumbnails(raw_thumbnails)
+                    })
+        
+        # Handle albums and singles: use get_artist_albums with the provided params.
+        for content_type in ["albums", "singles"]:
+            if content_type in artist_info:
+                content_data = artist_info[content_type]
+                params = content_data.get("params")
+                if params:
+                    try:
+                        releases = ytmusic.get_artist_albums(artist_id, params)
+                        for release in releases:
+                            album_id = release.get("browseId")
+                            if album_id:
+                                try:
+                                    album_info = ytmusic.get_album(album_id)
+                                    # Get album thumbnails as a fallback if track thumbnails are not available.
+                                    album_thumbnails = album_info.get("thumbnails", [])
+                                    for track in album_info.get("tracks", []):
+                                        raw_thumbnails = track.get("thumbnails") or album_thumbnails
+                                        all_songs.append({
+                                            "title": track.get("title"),
+                                            "videoId": track.get("videoId"),
+                                            "artist": track.get("artists", [{}])[0].get("name"),
+                                            "album": album_info.get("title"),
+                                            "duration": track.get("duration"),
+                                            "thumbnails": format_thumbnails(raw_thumbnails)
+                                        })
+                                except Exception as e:
+                                    logger.error(f"Error fetching album {album_id}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error fetching {content_type} for artist {artist_id}: {e}")
+
+    # Remove duplicates while preserving order.
+    seen = set()
+    unique_songs = []
+    for song in all_songs:
+        identifier = song.get("videoId") or song.get("title")
+        if identifier and identifier not in seen:
+            seen.add(identifier)
+            unique_songs.append(song)
+
+    # Shuffle the list so that songs from different artists are mixed.
+    random.shuffle(unique_songs)
+
+    return jsonify(unique_songs)
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
