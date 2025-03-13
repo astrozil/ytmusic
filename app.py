@@ -297,6 +297,11 @@ def get_album_details(album_id):
     except Exception as e:
         logger.error(f"Error fetching album details: {e}")
         abort(500, description="An error occurred while processing your request")
+
+# Mix Endpoint
+
+
+
 def format_thumbnails(thumbnails):
     """
     Format a list of thumbnails to include only height, url, and width.
@@ -338,10 +343,21 @@ def mix_songs():
                     playlist_data = ytmusic.get_playlist(songs_browse_id)
                     for track in playlist_data.get("tracks", []):
                         raw_thumbnails = track.get("thumbnails")
+                        # Build list of artist objects with id and name.
+                        if track.get("artists"):
+                            artists = [
+                                {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
+                                for a in track.get("artists")
+                            ]
+                        elif track.get("artist"):
+                            artists = [{"id": None, "name": track.get("artist")}]
+                        else:
+                            artists = []
+                        
                         all_songs.append({
                             "title": track.get("title"),
                             "videoId": track.get("videoId"),
-                            "artist": track.get("artists", [{}])[0].get("name"),
+                            "artists": artists,
                             "album": None,  # Album info might not be provided here.
                             "duration": track.get("duration"),
                             "thumbnails": format_thumbnails(raw_thumbnails)
@@ -352,10 +368,20 @@ def mix_songs():
                 # Fallback: use the top results directly.
                 for song in songs_data.get("results", []):
                     raw_thumbnails = song.get("thumbnails")
+                    if song.get("artists"):
+                        artists = [
+                            {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
+                            for a in song.get("artists")
+                        ]
+                    elif song.get("artist"):
+                        artists = [{"id": None, "name": song.get("artist")}]
+                    else:
+                        artists = []
+                    
                     all_songs.append({
                         "title": song.get("title"),
                         "videoId": song.get("videoId"),
-                        "artist": song.get("artist"),
+                        "artists": artists,
                         "album": song.get("album"),
                         "duration": song.get("duration"),
                         "thumbnails": format_thumbnails(raw_thumbnails)
@@ -374,14 +400,27 @@ def mix_songs():
                             if album_id:
                                 try:
                                     album_info = ytmusic.get_album(album_id)
-                                    # Get album thumbnails as a fallback if track thumbnails are not available.
+                                    # Use album thumbnails as a fallback if track thumbnails are not available.
                                     album_thumbnails = album_info.get("thumbnails", [])
                                     for track in album_info.get("tracks", []):
                                         raw_thumbnails = track.get("thumbnails") or album_thumbnails
+                                        if track.get("artists"):
+                                            artists = [
+                                                {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
+                                                for a in track.get("artists")
+                                            ]
+                                        elif album_info.get("artists"):
+                                            artists = [
+                                                {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
+                                                for a in album_info.get("artists")
+                                            ]
+                                        else:
+                                            artists = []
+                                        
                                         all_songs.append({
                                             "title": track.get("title"),
                                             "videoId": track.get("videoId"),
-                                            "artist": track.get("artists", [{}])[0].get("name"),
+                                            "artists": artists,
                                             "album": album_info.get("title"),
                                             "duration": track.get("duration"),
                                             "thumbnails": format_thumbnails(raw_thumbnails)
@@ -404,6 +443,8 @@ def mix_songs():
     random.shuffle(unique_songs)
 
     return jsonify(unique_songs)
+
+
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
