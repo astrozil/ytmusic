@@ -444,7 +444,84 @@ def mix_songs():
 
     return jsonify(unique_songs)
 
+#favourite songs fetch 
 
+def transform_song_data(song_data):
+    """
+    Transform the song data retrieved from ytmusicapi to match the desired response structure.
+    """
+    try:
+        video_details = song_data.get('videoDetails', {})
+        microformat = song_data.get('microformat', {}).get('microformatDataRenderer', {})
+        streaming_data = song_data.get('streamingData', {})
+        player_overlays = song_data.get('playerOverlays', {}).get('playerOverlayRenderer', {})
+        music_analytics = song_data.get('musicAnalytics', {})
+
+        # Extract artist information
+        artists = video_details.get('author', '')
+        artist_name = artists if isinstance(artists, str) else ', '.join(artists)
+        artist_id = video_details.get('channelId', '')
+
+        # Extract thumbnails
+        thumbnails = video_details.get('thumbnail', {}).get('thumbnails', [])
+        formatted_thumbnails = [{'url': thumb.get('url'), 'width': thumb.get('width'), 'height': thumb.get('height')} for thumb in thumbnails]
+
+        # Extract feedback tokens
+        feedback_tokens = music_analytics.get('feedbackTokens', {})
+        add_token = feedback_tokens.get('add', '')
+        remove_token = feedback_tokens.get('remove', '')
+
+        # Construct the transformed data
+        transformed_data = {
+            "album": None,  # Album information might not be available
+            "artists": [
+                {
+                    "id": artist_id,
+                    "name": artist_name
+                }
+            ],
+            "category": microformat.get('category', None),
+            "duration": video_details.get('lengthSeconds', '0'),
+            "duration_seconds": int(video_details.get('lengthSeconds', '0')),
+            "feedbackTokens": {
+                "add": add_token,
+                "remove": remove_token
+            },
+            "inLibrary": False,  # This information might not be directly available
+            "isExplicit": video_details.get('isLive', False),
+            "resultType": "song",
+            "thumbnails": formatted_thumbnails,
+            "title": video_details.get('title', ''),
+            "videoId": video_details.get('videoId', ''),
+            "videoType": video_details.get('isLive', False) and "LIVE" or "MUSIC_VIDEO_TYPE_ATV",
+            "year": None  # Year information might not be available
+        }
+        return transformed_data
+    except Exception as e:
+        logger.error(f"Error transforming song data: {e}")
+        return None
+
+@app.route("/songs", methods=["POST"])
+def get_songs():
+    song_ids = request.json.get("song_ids", [])
+    
+    if not song_ids or not isinstance(song_ids, list):
+        abort(400, description="A list of song IDs is required.")
+    
+    songs_data = []
+    for song_id in song_ids:
+        try:
+            song_data = ytmusic.get_song(song_id)
+            transformed_data = transform_song_data(song_data)
+            if transformed_data:
+                songs_data.append(transformed_data)
+            else:
+                songs_data.append({"error": f"Failed to transform data for song ID {song_id}"})
+        except Exception as e:
+            logger.error(f"Error fetching data for song ID {song_id}: {e}")
+            songs_data.append({"error": f"Failed to fetch data for song ID {song_id}"})
+    
+    return jsonify(songs_data)
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
