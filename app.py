@@ -521,7 +521,60 @@ def get_songs():
             logger.error(f"Error fetching data for song ID {song_id}: {e}")
             songs_data.append({"error": f"Failed to fetch data for song ID {song_id}"})
     
+
     return jsonify(songs_data)
+
+#recommendation endpoint
+@app.route("/recommendations", methods=["POST"])
+def get_recommendations():
+    data = request.get_json()
+    if not data or 'song_ids' not in data:
+        abort(400, description="Missing 'song_ids' in request body")
+    
+    song_ids = data['song_ids']
+    if not isinstance(song_ids, list) or len(song_ids) < 1 or len(song_ids) > 50:
+        abort(400, description="song_ids must be a list containing 1 to 50 song IDs")
+    
+    all_tracks = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Create a future for each song ID
+        futures = {executor.submit(ytmusic.get_watch_playlist, song_id): song_id for song_id in song_ids}
+        
+        for future in as_completed(futures):
+            song_id = futures[future]
+            try:
+                result = future.result()
+                tracks = result.get('tracks', [])
+                # Enrich track data with seed song ID for debugging
+                for track in tracks:
+                    track['seedSongId'] = song_id
+                all_tracks.extend(tracks)
+            except Exception as e:
+                logger.error(f"Error processing song {song_id}: {e}")
+    
+    # Deduplicate tracks while preserving order
+    seen = set()
+    unique_tracks = []
+    for track in all_tracks:
+        video_id = track.get('videoId')
+        if video_id and video_id not in seen:
+            seen.add(video_id)
+            # Remove temporary seedSongId before returning
+            track.pop('seedSongId', None)
+            unique_tracks.append(track)
+    
+    # Prioritize tracks that appear in multiple seed song recommendations
+    track_counts = {}
+    for track in all_tracks:
+        video_id = track.get('videoId')
+        if video_id:
+            track_counts[video_id] = track_counts.get(video_id, 0) + 1
+    
+    # Sort by frequency (descending) and shuffle within same frequency groups
+    unique_tracks.sort(key=lambda x: (-track_counts[x['videoId']], random.random()))
+    
+    # Return top 50 tracks
+    return jsonify(unique_tracks[:50])
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
