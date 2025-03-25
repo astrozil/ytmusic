@@ -570,11 +570,57 @@ def get_recommendations():
         if video_id:
             track_counts[video_id] = track_counts.get(video_id, 0) + 1
     
-    # Sort by frequency (descending) and shuffle within same frequency groups
-    unique_tracks.sort(key=lambda x: (-track_counts[x['videoId']], random.random()))
+    # Add randomness while still considering relevance
+    # Group tracks by frequency
+    frequency_groups = {}
+    for track in unique_tracks:
+        count = track_counts[track['videoId']]
+        if count not in frequency_groups:
+            frequency_groups[count] = []
+        frequency_groups[count].append(track)
     
-    # Return top 50 tracks
-    return jsonify(unique_tracks[:50])
+    # Shuffle each frequency group
+    for count in frequency_groups:
+        random.shuffle(frequency_groups[count])
+    
+    # Rebuild the list with some randomness
+    # Option 1: More randomness - randomly select from different frequency groups
+    result_tracks = []
+    counts = sorted(frequency_groups.keys(), reverse=True)
+    
+    # Ensure we get tracks from all frequency groups
+    while len(result_tracks) < 50 and frequency_groups:
+        # Randomly select a frequency group with weighted probability
+        # Higher frequencies have higher chances of being selected
+        weights = [c for c in counts if frequency_groups[c]]
+        if not weights:
+            break
+            
+        selected_count = random.choices(
+            weights,
+            weights=weights,  # Weight by frequency
+            k=1
+        )[0]
+        
+        # Take a track from this group
+        if frequency_groups[selected_count]:
+            track = frequency_groups[selected_count].pop(0)
+            result_tracks.append(track)
+            
+            # Remove empty groups
+            if not frequency_groups[selected_count]:
+                frequency_groups.pop(selected_count)
+                counts.remove(selected_count)
+    
+    # If we need more tracks, take from unique_tracks
+    if len(result_tracks) < 50:
+        # Get tracks that weren't already selected
+        remaining_ids = set(t['videoId'] for t in unique_tracks) - set(t['videoId'] for t in result_tracks)
+        remaining_tracks = [t for t in unique_tracks if t['videoId'] in remaining_ids]
+        random.shuffle(remaining_tracks)
+        result_tracks.extend(remaining_tracks[:50-len(result_tracks)])
+    
+    return jsonify(result_tracks[:50])
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
