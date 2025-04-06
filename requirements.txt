@@ -4,3 +4,4 @@ beautifulsoup4    # For lyrics
 flask_caching
 flask_limiter
 billboard.py
+waitress
