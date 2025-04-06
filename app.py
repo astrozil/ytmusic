@@ -10,8 +10,9 @@ import concurrent.futures
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
+from waitress import serve
 
-
+cache = Cache(config={'CACHE_TYPE': 'simple'})
 
 app = Flask(__name__)
 original_get = requests.get
@@ -234,56 +235,115 @@ def trending_songs():
         abort(500, description="An error occurred while fetching trending songs")
 
 # Billboard songs endpoint
-
 async def async_fetch_billboard_song(entry):
-    query = f"{entry.title} {entry.artist}"
-    # Wrap the blocking ytmusic.search call so it can run concurrently.
-    results = await asyncio.to_thread(ytmusic.search, query, filter="songs")
-    best_match = results[0] if results else {}
-    return {
-        "rank": entry.rank,
-        "title": entry.title,
-        "artist": entry.artist,
-        "lastPos": entry.lastPos,
-        "peakPos": entry.peakPos,
-        "weeks": entry.weeks,
-        "ytmusic_result": best_match  
-    }
-# Configure caching (simple in-memory cache for demonstration)
-cache = Cache(app, config={'CACHE_TYPE': 'simple'})
+    """Fetch additional song details for a Billboard chart entry"""
+    try:
+        query = f"{entry.title} {entry.artist}"
+        # Use asyncio.to_thread to run blocking operations asynchronously
+        results = await asyncio.to_thread(ytmusic.search, query, filter="songs")
+        best_match = results[0] if results else {}
+        
+        return {
+            "rank": entry.rank,
+            "title": entry.title,
+            "artist": entry.artist,
+            "lastPos": entry.lastPos,
+            "peakPos": entry.peakPos,
+            "weeks": entry.weeks,
+            "ytmusic_result": best_match  
+        }
+    except Exception as e:
+        logger.error(f"Error fetching details for {entry.title}: {e}")
+        return {
+            "rank": entry.rank,
+            "title": entry.title,
+            "artist": entry.artist,
+            "lastPos": entry.lastPos,
+            "peakPos": entry.peakPos,
+            "weeks": entry.weeks,
+            "ytmusic_result": {}
+        }
+
+def get_billboard_chart(chart_name='hot-100', date=None):
+    """Get Billboard chart data with error handling"""
+    try:
+        return billboard.ChartData(chart_name, date=date)
+    except Exception as e:
+        logger.error(f"Error fetching Billboard chart {chart_name}: {e}")
+        return None
+
+def register_billboard_routes(app):
+    """Register all Billboard-related routes"""
+    
+    # Initialize cache with the app
+    cache.init_app(app)
 @app.route("/billboard", methods=["GET"])
 async def billboard_songs():
-    # Get pagination parameters with defaults (e.g., 10 songs per page)
-    limit_param = request.args.get("limit", "100")
-    offset_param = request.args.get("offset", "0")
-    try:
-        limit = int(limit_param)
-        offset = int(offset_param)
-    except ValueError:
-        limit = 100
-        offset = 0
-
-    # Create a unique cache key based on the limit and offset.
-    cache_key = f"billboard_{offset}_{limit}"
-    cached_entries = cache.get(cache_key)
-    if cached_entries:
-        return jsonify(cached_entries)
+    page = request.args.get("page", 1, type=int)
+    per_page = 10
+    
+    cache_key = f"billboard_page_{page}"
+    cached_data = cache.get(cache_key)
+    
+    if cached_data:
+        return jsonify(cached_data)
     
     try:
-     
         chart = await asyncio.to_thread(billboard.ChartData, 'hot-100')
-      
-        chart_subset = chart[offset:offset + limit]
-  
-        tasks = [async_fetch_billboard_song(entry) for entry in chart_subset]
-        entries = await asyncio.gather(*tasks)
-       
-        cache.set(cache_key, entries, timeout=3600)
-        return jsonify(entries)
+        start_index = (page - 1) * per_page
+        end_index = start_index + per_page
+        
+        songs = []
+        for entry in chart[start_index:end_index]:
+            song = await async_fetch_billboard_song(entry)
+            songs.append(song)
+        
+        response_data = {
+            "data": songs,
+            "metadata": {
+                "current_page": page,
+                "per_page": per_page,
+                "total_items": len(chart),
+                "total_pages": -(-len(chart) // per_page),  # Ceiling division
+                "has_next": end_index < len(chart)
+            }
+        }
+        
+        cache.set(cache_key, response_data, timeout=3600)  # Cache for 1 hour
+        
+        # Prefetch next page
+        if response_data["metadata"]["has_next"]:
+            asyncio.create_task(prefetch_next_page(page + 1, per_page, chart))
+        
+        return jsonify(response_data)
     except Exception as e:
-        logger.error(f"Error fetching Billboard songs: {e}")
-        abort(500, description="An error occurred while fetching Billboard songs")
+        return jsonify({"error": str(e)}), 500
 
+async def prefetch_next_page(next_page, per_page, chart):
+    cache_key = f"billboard_page_{next_page}"
+    if cache.get(cache_key):
+        return  # Next page already cached
+    
+    start_index = (next_page - 1) * per_page
+    end_index = start_index + per_page
+    
+    songs = []
+    for entry in chart[start_index:end_index]:
+        song = await async_fetch_billboard_song(entry)
+        songs.append(song)
+    
+    response_data = {
+        "data": songs,
+        "metadata": {
+            "current_page": next_page,
+            "per_page": per_page,
+            "total_items": len(chart),
+            "total_pages": -(-len(chart) // per_page),
+            "has_next": end_index < len(chart)
+        }
+    }
+    
+    cache.set(cache_key, response_data, timeout=3600) 
 
 # album endpoint
 @app.route("/album/<album_id>", methods=["GET"])
@@ -621,6 +681,21 @@ def get_recommendations():
         result_tracks.extend(remaining_tracks[:50-len(result_tracks)])
     
     return jsonify(result_tracks[:50])
+# search Suggestion endpoint
+@app.route("/search_suggestions", methods=["GET"])
+def get_search_suggestions():
+    query = request.args.get("query")
+    
+    if not query or not isinstance(query, str):
+        abort(400, description="Query parameter is required and must be a string")
+
+    try:
+        suggestions = ytmusic.get_search_suggestions(query)
+        return jsonify(suggestions)
+    except Exception as e:
+        logger.error(f"Error fetching search suggestions: {e}")
+        abort(500, description="An error occurred while processing your request")
+
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
@@ -641,4 +716,4 @@ def internal_error(error):
 
 # Run the app
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    serve(app, host="0.0.0.0", port=5000)
