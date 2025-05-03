@@ -31,7 +31,7 @@ requests.get = patched_get
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ytmusic = YTMusic("browser.json")
+ytmusic = YTMusic("auth/oauth.json")
 
 # Helper function to format Genius URL
 def format_genius_url(artist, song_title):
