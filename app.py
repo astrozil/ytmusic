@@ -12,9 +12,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 from waitress import serve
 
-cache = Cache(config={'CACHE_TYPE': 'simple'})
+
 
 app = Flask(__name__)
+app.config['CACHE_TYPE'] = 'SimpleCache'  # or another cache type
+cache = Cache(app)
 original_get = requests.get
 
 def patched_get(url, *args, **kwargs):
@@ -275,8 +277,7 @@ def get_billboard_chart(chart_name='hot-100', date=None):
 def register_billboard_routes(app):
     """Register all Billboard-related routes"""
     
-    # Initialize cache with the app
-    cache.init_app(app)
+    
 @app.route("/billboard", methods=["GET"])
 async def billboard_songs():
     page = request.args.get("page", 1, type=int)
