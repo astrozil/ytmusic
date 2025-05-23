@@ -11,6 +11,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 from waitress import serve
+from datetime import datetime
+
 
 
 
@@ -18,6 +20,13 @@ app = Flask(__name__)
 app.config['CACHE_TYPE'] = 'SimpleCache'  # or another cache type
 cache = Cache(app)
 original_get = requests.get
+
+def make_daily_cache_key():
+    """Generate a cache key that includes the current date"""
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    artist_ids_param = request.args.get("artists", "")
+    limit_param = request.args.get("limit", "50")
+    return f"mix_daily_{current_date}_{artist_ids_param}_{limit_param}"
 
 def patched_get(url, *args, **kwargs):
     headers = kwargs.get("headers", {})
@@ -379,17 +388,28 @@ def format_thumbnails(thumbnails):
     return formatted
 
 @app.route("/mix", methods=["GET"])
+@cache.cached(key_prefix=make_daily_cache_key)
 def mix_songs():
     artist_ids_param = request.args.get("artists")
+    limit_param = request.args.get("limit", "50")
+    
     if not artist_ids_param:
         abort(400, description="artists parameter is required (comma-separated artist IDs)")
+    
+    # Parse limit parameter
+    try:
+        limit = int(limit_param)
+        if limit <= 0:
+            limit = 50
+    except ValueError:
+        limit = 50
     
     artist_ids = [x.strip() for x in artist_ids_param.split(",")]
     all_songs = []
 
+    # [Keep all your existing song fetching logic - no changes needed]
     for artist_id in artist_ids:
         try:
-            # Get artist information including top releases.
             artist_info = ytmusic.get_artist(artist_id)
         except Exception as e:
             logger.error(f"Error retrieving artist {artist_id}: {e}")
@@ -404,7 +424,6 @@ def mix_songs():
                     playlist_data = ytmusic.get_playlist(songs_browse_id)
                     for track in playlist_data.get("tracks", []):
                         raw_thumbnails = track.get("thumbnails")
-                        # Build list of artist objects with id and name.
                         if track.get("artists"):
                             artists = [
                                 {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
@@ -419,14 +438,13 @@ def mix_songs():
                             "title": track.get("title"),
                             "videoId": track.get("videoId"),
                             "artists": artists,
-                            "album": None,  # Album info might not be provided here.
+                            "album": None,
                             "duration": track.get("duration"),
                             "thumbnails": format_thumbnails(raw_thumbnails)
                         })
                 except Exception as e:
                     logger.error(f"Error fetching playlist for songs from artist {artist_id}: {e}")
             else:
-                # Fallback: use the top results directly.
                 for song in songs_data.get("results", []):
                     raw_thumbnails = song.get("thumbnails")
                     if song.get("artists"):
@@ -448,7 +466,7 @@ def mix_songs():
                         "thumbnails": format_thumbnails(raw_thumbnails)
                     })
         
-        # Handle albums and singles: use get_artist_albums with the provided params.
+        # Handle albums and singles
         for content_type in ["albums", "singles"]:
             if content_type in artist_info:
                 content_data = artist_info[content_type]
@@ -461,7 +479,6 @@ def mix_songs():
                             if album_id:
                                 try:
                                     album_info = ytmusic.get_album(album_id)
-                                    # Use album thumbnails as a fallback if track thumbnails are not available.
                                     album_thumbnails = album_info.get("thumbnails", [])
                                     for track in album_info.get("tracks", []):
                                         raw_thumbnails = track.get("thumbnails") or album_thumbnails
@@ -503,7 +520,8 @@ def mix_songs():
     # Shuffle the list so that songs from different artists are mixed.
     random.shuffle(unique_songs)
 
-    return jsonify(unique_songs)
+    # Return limited results (default 50)
+    return jsonify(unique_songs[:limit])
 
 #favourite songs fetch 
 
