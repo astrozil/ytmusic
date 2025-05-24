@@ -371,150 +371,34 @@ def get_album_details(album_id):
 # Mix Endpoint
 
 
+
 def format_thumbnails(thumbnails):
     """
-    Format and enhance thumbnails to include higher resolution options.
+    Format a list of thumbnails to include only height, url, and width.
     """
     if not thumbnails:
         return []
-    
     formatted = []
-    highest_res_url = None
-    
-    # Sort thumbnails by size (largest first)
-    sorted_thumbnails = sorted(thumbnails, key=lambda x: (x.get("width", 0) * x.get("height", 0)), reverse=True)
-    
-    for thumb in sorted_thumbnails:
-        width = thumb.get("width", 0)
-        height = thumb.get("height", 0)
-        url = thumb.get("url", "")
-        
-        # Keep track of the highest resolution URL for enhancement
-        if not highest_res_url and url:
-            highest_res_url = url
-        
+    for thumb in thumbnails:
         formatted.append({
-            "height": height,
-            "width": width,
-            "url": url
+            "height": thumb.get("height"),
+            "width": thumb.get("width"),
+            "url": thumb.get("url")
         })
-    
-    # Add enhanced high-resolution versions
-    if highest_res_url:
-        enhanced_thumbnails = generate_enhanced_thumbnails(highest_res_url)
-        formatted.extend(enhanced_thumbnails)
-    
-    # Remove duplicates and sort by size (largest first)
-    seen_urls = set()
-    unique_formatted = []
-    for thumb in sorted(formatted, key=lambda x: (x.get("width", 0) * x.get("height", 0)), reverse=True):
-        if thumb["url"] not in seen_urls:
-            seen_urls.add(thumb["url"])
-            unique_formatted.append(thumb)
-    
-    return unique_formatted
-
-def generate_enhanced_thumbnails(base_url):
-    """
-    Generate higher resolution thumbnail URLs from a base YouTube thumbnail URL.
-    """
-    enhanced = []
-    
-    if not base_url:
-        return enhanced
-    
-    # YouTube thumbnail URL patterns and their high-res alternatives
-    enhancements = [
-        # For YouTube Music thumbnails
-        ("w60-h60", "w500-h500"),
-        ("w120-h120", "w500-h500"),
-        ("w226-h226", "w500-h500"),
-        ("=w60-h60", "=w500-h500"),
-        ("=w120-h120", "=w500-h500"),
-        ("=w226-h226", "=w500-h500"),
-        
-        # For standard YouTube thumbnails
-        ("mqdefault", "maxresdefault"),
-        ("hqdefault", "maxresdefault"),
-        ("sddefault", "maxresdefault"),
-        
-        # Additional size parameters
-        ("s60", "s500"),
-        ("s120", "s500"),
-        ("s226", "s500"),
-    ]
-    
-    for old_param, new_param in enhancements:
-        if old_param in base_url:
-            enhanced_url = base_url.replace(old_param, new_param)
-            enhanced.append({
-                "height": 500,
-                "width": 500,
-                "url": enhanced_url
-            })
-            break
-    
-    # If no pattern matched, try adding size parameters to the URL
-    if not enhanced and "googleusercontent.com" in base_url:
-        # For Google User Content URLs, add size parameters
-        if "=" not in base_url:
-            enhanced_url = f"{base_url}=s500"
-        else:
-            enhanced_url = f"{base_url.split('=')[0]}=s500"
-        
-        enhanced.append({
-            "height": 500,
-            "width": 500,
-            "url": enhanced_url
-        })
-    
-    return enhanced
-def ensure_min_thumbnail_quality(thumbnails, min_size=200):
-    """
-    Ensure at least one thumbnail meets minimum size requirements.
-    """
-    if not thumbnails:
-        return thumbnails
-    
-    # Check if we have at least one thumbnail with decent resolution
-    has_good_quality = any(
-        thumb.get("width", 0) >= min_size and thumb.get("height", 0) >= min_size 
-        for thumb in thumbnails
-    )
-    
-    if not has_good_quality:
-        # Try to enhance the best available thumbnail
-        best_thumb = max(thumbnails, key=lambda x: x.get("width", 0) * x.get("height", 0))
-        if best_thumb.get("url"):
-            enhanced = generate_enhanced_thumbnails(best_thumb["url"])
-            thumbnails.extend(enhanced)
-    
-    return thumbnails
-
+    return formatted
 
 @app.route("/mix", methods=["GET"])
-@cache.cached(key_prefix=make_daily_cache_key)
 def mix_songs():
     artist_ids_param = request.args.get("artists")
-    limit_param = request.args.get("limit", "50")
-    
     if not artist_ids_param:
         abort(400, description="artists parameter is required (comma-separated artist IDs)")
-    
-    # Parse limit parameter
-    try:
-        limit = int(limit_param)
-        if limit <= 0:
-            limit = 50
-    except ValueError:
-        limit = 50
     
     artist_ids = [x.strip() for x in artist_ids_param.split(",")]
     all_songs = []
 
-    # [Keep all your existing song fetching logic - no changes needed]
     for artist_id in artist_ids:
         try:
+            # Get artist information including top releases.
             artist_info = ytmusic.get_artist(artist_id)
         except Exception as e:
             logger.error(f"Error retrieving artist {artist_id}: {e}")
@@ -528,13 +412,8 @@ def mix_songs():
                 try:
                     playlist_data = ytmusic.get_playlist(songs_browse_id)
                     for track in playlist_data.get("tracks", []):
-                        raw_thumbnails = track.get("thumbnails", [])
-# Also try to get album thumbnails as backup
-                        if not raw_thumbnails and track.get("album"):
-                         # Try to get album thumbnails if available
-                         album_data = track.get("album", {})
-                        if isinstance(album_data, dict):
-                          raw_thumbnails = album_data.get("thumbnails", [])
+                        raw_thumbnails = track.get("thumbnails")
+                        # Build list of artist objects with id and name.
                         if track.get("artists"):
                             artists = [
                                 {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
@@ -549,13 +428,14 @@ def mix_songs():
                             "title": track.get("title"),
                             "videoId": track.get("videoId"),
                             "artists": artists,
-                            "album": None,
+                            "album": None,  # Album info might not be provided here.
                             "duration": track.get("duration"),
                             "thumbnails": format_thumbnails(raw_thumbnails)
                         })
                 except Exception as e:
                     logger.error(f"Error fetching playlist for songs from artist {artist_id}: {e}")
             else:
+                # Fallback: use the top results directly.
                 for song in songs_data.get("results", []):
                     raw_thumbnails = song.get("thumbnails")
                     if song.get("artists"):
@@ -577,7 +457,7 @@ def mix_songs():
                         "thumbnails": format_thumbnails(raw_thumbnails)
                     })
         
-        # Handle albums and singles
+        # Handle albums and singles: use get_artist_albums with the provided params.
         for content_type in ["albums", "singles"]:
             if content_type in artist_info:
                 content_data = artist_info[content_type]
@@ -590,14 +470,10 @@ def mix_songs():
                             if album_id:
                                 try:
                                     album_info = ytmusic.get_album(album_id)
+                                    # Use album thumbnails as a fallback if track thumbnails are not available.
                                     album_thumbnails = album_info.get("thumbnails", [])
                                     for track in album_info.get("tracks", []):
-                                        raw_thumbnails = track.get("thumbnails", [])
-                                        if not raw_thumbnails:
-                                            raw_thumbnails = album_thumbnails
-                                            # Ensure we have a list
-                                            if not isinstance(raw_thumbnails, list):
-                                                raw_thumbnails = []
+                                        raw_thumbnails = track.get("thumbnails") or album_thumbnails
                                         if track.get("artists"):
                                             artists = [
                                                 {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
@@ -609,16 +485,15 @@ def mix_songs():
                                                 for a in album_info.get("artists")
                                             ]
                                         else:
-                                            artists = [] 
-                                            formatted_thumbnails = format_thumbnails(raw_thumbnails)
-                                            formatted_thumbnails = ensure_min_thumbnail_quality(formatted_thumbnails)
+                                            artists = []
+                                        
                                         all_songs.append({
                                             "title": track.get("title"),
                                             "videoId": track.get("videoId"),
                                             "artists": artists,
                                             "album": album_info.get("title"),
                                             "duration": track.get("duration"),
-                                            "thumbnails": formatted_thumbnails
+                                            "thumbnails": format_thumbnails(raw_thumbnails)
                                         })
                                 except Exception as e:
                                     logger.error(f"Error fetching album {album_id}: {e}")
@@ -637,8 +512,7 @@ def mix_songs():
     # Shuffle the list so that songs from different artists are mixed.
     random.shuffle(unique_songs)
 
-    # Return limited results (default 50)
-    return jsonify(unique_songs[:limit])
+    return jsonify(unique_songs)
 
 #favourite songs fetch 
 
