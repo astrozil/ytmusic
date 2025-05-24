@@ -11,13 +11,19 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 from waitress import serve
-from datetime import datetime
+from datetime import datetime,timedelta
 
 
 
 
 app = Flask(__name__)
-app.config['CACHE_TYPE'] = 'SimpleCache'  # or another cache type
+app.config.update({
+    'CACHE_TYPE': 'RedisCache',  # Use Redis for production
+    'CACHE_REDIS_URL': 'redis://localhost:6379/0',
+    'CACHE_DEFAULT_TIMEOUT': 86400,  # 24 hours default
+    'CACHE_THRESHOLD': 5000,  # Higher threshold to prevent premature eviction
+    'CACHE_KEY_PREFIX': 'ytmusic_api_'
+})
 cache = Cache(app)
 original_get = requests.get
 
@@ -27,6 +33,7 @@ def make_daily_cache_key():
     artist_ids_param = request.args.get("artists", "")
     limit_param = request.args.get("limit", "50")
     return f"mix_daily_{current_date}_{artist_ids_param}_{limit_param}"
+
 def make_recommendations_cache_key():
     """Generate a cache key for recommendations that includes the current date and song_ids"""
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -41,6 +48,18 @@ def make_recommendations_cache_key():
     
     return f"recommendations_daily_{current_date}_{hash(song_ids_str)}"
 
+def get_seconds_until_midnight():
+    """Calculate seconds remaining until midnight for true daily refresh"""
+    now = datetime.now()
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((midnight - now).total_seconds())
+def make_trending_cache_key():
+    """Generate a cache key for trending that includes the current date and parameters"""
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    country_param = request.args.get("country", "US")
+    limit_param = request.args.get("limit", "50")
+    
+    return f"trending_daily_{current_date}_{country_param}_{limit_param}"
 
 def patched_get(url, *args, **kwargs):
     headers = kwargs.get("headers", {})
@@ -241,6 +260,14 @@ def fetch_song(video):
 
 @app.route("/trending", methods=["GET"])
 def trending_songs():
+    # Generate cache key
+    cache_key = make_trending_cache_key()
+    
+    # Check cache first
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        logger.info(f"Returning cached trending data for key: {cache_key}")
+        return jsonify(cached_data)
     country = request.args.get("country", "US")
     limit_param = request.args.get("limit", "50")
     try:
@@ -255,7 +282,9 @@ def trending_songs():
         # Use a thread pool to search for songs concurrently.
         with concurrent.futures.ThreadPoolExecutor() as executor:
             trending_songs = list(executor.map(fetch_song, trending_video_items))
-        
+         # Cache until midnight for true daily refresh
+        cache.set(cache_key, trending_songs, timeout=get_seconds_until_midnight())
+        logger.info(f"Cached trending data for key: {cache_key}")
         return jsonify(trending_songs)
     except Exception as e:
         logger.error(f"Error fetching trending songs: {e}")
@@ -358,7 +387,7 @@ def register_billboard_routes(app):
     """Register all Billboard-related routes"""
 def get_billboard_cache_key():
     """Generate cache key based on current week to auto-refresh when Billboard updates"""
-    from datetime import datetime, timedelta
+   
     
     # Billboard typically updates on Tuesdays
     today = datetime.now()
@@ -368,12 +397,26 @@ def get_billboard_cache_key():
     week_key = current_tuesday.strftime("%Y-%m-%d")
     
     return f"billboard_hot_100_{week_key}"
+
+def get_seconds_until_next_tuesday():
+    """Calculate seconds until next Tuesday (Billboard update day)"""
+    now = datetime.now()
+    days_ahead = 1 - now.weekday()  # Tuesday is 1
+    if days_ahead <= 0:  # Target day already happened this week
+        days_ahead += 7
+    next_tuesday = now + timedelta(days=days_ahead)
+    next_tuesday = next_tuesday.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((next_tuesday - now).total_seconds())
+
+    
+    
 @app.route("/billboard", methods=["GET"])
 async def billboard_songs():
     cache_key = get_billboard_cache_key()  # Use date-based cache key
     cached_data = cache.get(cache_key)
     
     if cached_data:
+        logger.info(f"Returning cached Billboard data for key: {cache_key}")
         return jsonify(cached_data)
     
     try:
@@ -394,8 +437,8 @@ async def billboard_songs():
             }
         }
         
-        # Cache for 7 days (Billboard updates weekly on Tuesdays)
-        cache.set(cache_key, response_data, timeout=604800)  # 7 days = 604800 seconds
+        cache.set(cache_key, response_data, timeout=get_seconds_until_next_tuesday())
+        logger.info(f"Cached Billboard data for key: {cache_key}")
         
         return jsonify(response_data)
     except Exception as e:
@@ -436,8 +479,16 @@ def format_thumbnails(thumbnails):
     return formatted
 
 @app.route("/mix", methods=["GET"])
-@cache.cached(key_prefix=make_daily_cache_key)
+
 def mix_songs():
+    # Generate cache key
+    cache_key = make_daily_cache_key()
+    
+    # Check cache first
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        logger.info(f"Returning cached mix data for key: {cache_key}")
+        return jsonify(cached_data)
     artist_ids_param = request.args.get("artists")
     limit_param = request.args.get("limit", "50")
     
@@ -564,12 +615,13 @@ def mix_songs():
         if identifier and identifier not in seen:
             seen.add(identifier)
             unique_songs.append(song)
-
+    result = unique_songs[:limit]
     # Shuffle the list so that songs from different artists are mixed.
     random.shuffle(unique_songs)
-
+    cache.set(cache_key, result, timeout=get_seconds_until_midnight())
+    logger.info(f"Cached mix data for key: {cache_key}")
     # Return limited results (default 50)
-    return jsonify(unique_songs[:limit])
+    return jsonify(result)
 #favourite songs fetch 
 
 def transform_song_data(song_data):
@@ -660,8 +712,7 @@ def get_recommendations():
     song_ids = data['song_ids']
     if not isinstance(song_ids, list) or len(song_ids) < 1 or len(song_ids) > 50:
         abort(400, description="song_ids must be a list containing 1 to 50 song IDs")
-    
-    # Generate cache key
+     # Generate cache key
     cache_key = make_recommendations_cache_key()
     
     # Check cache first
@@ -756,8 +807,8 @@ def get_recommendations():
     
     final_result = result_tracks[:50]
     
-    # Cache the result for 24 hours (86400 seconds)
-    cache.set(cache_key, final_result, timeout=86400)
+    # Cache until midnight for true daily refresh
+    cache.set(cache_key, final_result, timeout=get_seconds_until_midnight())
     logger.info(f"Cached recommendations for key: {cache_key}")
     
     return jsonify(final_result)
