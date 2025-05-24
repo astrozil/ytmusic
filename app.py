@@ -256,10 +256,13 @@ async def async_fetch_billboard_song(entry):
         results = await asyncio.to_thread(ytmusic.search, query, filter="songs")
         best_match = results[0] if results else {}
         
+        # Parse and fetch artist data
+        artists = await parse_and_fetch_artists(entry.artist)
+        
         return {
             "rank": entry.rank,
             "title": entry.title,
-            "artist": entry.artist,
+            "artists": artists,  # Changed from "artist" to "artists"
             "lastPos": entry.lastPos,
             "peakPos": entry.peakPos,
             "weeks": entry.weeks,
@@ -270,12 +273,64 @@ async def async_fetch_billboard_song(entry):
         return {
             "rank": entry.rank,
             "title": entry.title,
-            "artist": entry.artist,
+            "artists": [{"id": None, "name": entry.artist}],  # Fallback format
             "lastPos": entry.lastPos,
             "peakPos": entry.peakPos,
             "weeks": entry.weeks,
             "ytmusic_result": {}
         }
+async def parse_and_fetch_artists(artist_string):
+    """Parse artist string and fetch individual artist IDs from YouTube Music"""
+    # Common separators used in Billboard for collaborations
+    separators = [' & ', ' and ', ' feat. ', ' featuring ', ' ft. ', ' with ', ', ']
+    
+    # Split the artist string by common separators
+    artists = [artist_string]
+    for separator in separators:
+        new_artists = []
+        for artist in artists:
+            new_artists.extend([a.strip() for a in artist.split(separator)])
+        artists = new_artists
+    
+    # Remove empty strings and duplicates while preserving order
+    artists = list(dict.fromkeys([a for a in artists if a.strip()]))
+    
+    result_artists = []
+    
+    # Fetch artist ID for each artist
+    for artist_name in artists:
+        try:
+            # Search for the artist on YouTube Music
+            search_results = await asyncio.to_thread(
+                ytmusic.search, 
+                artist_name, 
+                filter="artists"
+            )
+            
+            if search_results:
+                # Get the first result which should be the most relevant
+                artist_data = search_results[0]
+                artist_id = artist_data.get('browseId') or artist_data.get('id')
+                result_artists.append({
+                    "id": artist_id,
+                    "name": artist_name
+                })
+            else:
+                # If no results found, add with null ID
+                result_artists.append({
+                    "id": None,
+                    "name": artist_name
+                })
+        except Exception as e:
+            logger.error(f"Error fetching artist ID for {artist_name}: {e}")
+            # Add with null ID if search fails
+            result_artists.append({
+                "id": None,
+                "name": artist_name
+            })
+    
+    return result_artists
+
 
 def get_billboard_chart(chart_name='hot-100', date=None):
     """Get Billboard chart data with error handling"""
