@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 from waitress import serve
 from datetime import datetime,timedelta
+from redis import from_url as redis_from_url
 
 
 
