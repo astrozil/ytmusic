@@ -37,13 +37,9 @@ def make_daily_cache_key():
     limit_param = request.args.get("limit", "50")
     return f"mix_daily_{current_date}_{artist_ids_param}_{limit_param}"
 
-def make_recommendations_cache_key():
+def make_recommendations_cache_key(song_ids):
     """Generate a cache key for recommendations that includes the current date and song_ids"""
     current_date = datetime.now().strftime("%Y-%m-%d")
-    
-    # Get song_ids from request body
-    data = request.get_json()
-    song_ids = data.get('song_ids', []) if data else []
     
     # Sort song_ids to ensure consistent cache keys regardless of order
     sorted_song_ids = sorted(song_ids)
@@ -715,8 +711,7 @@ def get_recommendations():
     song_ids = data['song_ids']
     if not isinstance(song_ids, list) or len(song_ids) < 1 or len(song_ids) > 50:
         abort(400, description="song_ids must be a list containing 1 to 50 song IDs")
-     # Generate cache key
-    cache_key = make_recommendations_cache_key()
+    cache_key = make_recommendations_cache_key(song_ids)  
     
     # Check cache first
     cached_data = cache.get(cache_key)
