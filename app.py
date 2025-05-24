@@ -342,14 +342,21 @@ def get_billboard_chart(chart_name='hot-100', date=None):
 
 def register_billboard_routes(app):
     """Register all Billboard-related routes"""
+def get_billboard_cache_key():
+    """Generate cache key based on current week to auto-refresh when Billboard updates"""
+    from datetime import datetime, timedelta
     
+    # Billboard typically updates on Tuesdays
+    today = datetime.now()
+    # Calculate the Tuesday of current week
+    days_since_tuesday = (today.weekday() - 1) % 7
+    current_tuesday = today - timedelta(days=days_since_tuesday)
+    week_key = current_tuesday.strftime("%Y-%m-%d")
     
+    return f"billboard_hot_100_{week_key}"
 @app.route("/billboard", methods=["GET"])
 async def billboard_songs():
-    page = request.args.get("page", 1, type=int)
-    per_page = 10
-    
-    cache_key = f"billboard_page_{page}"
+    cache_key = get_billboard_cache_key()  # Use date-based cache key
     cached_data = cache.get(cache_key)
     
     if cached_data:
@@ -357,60 +364,30 @@ async def billboard_songs():
     
     try:
         chart = await asyncio.to_thread(billboard.ChartData, 'hot-100')
-        start_index = (page - 1) * per_page
-        end_index = start_index + per_page
         
+        # Fetch ALL 100 songs at once
         songs = []
-        for entry in chart[start_index:end_index]:
+        for entry in chart:  # Remove slicing, get all entries
             song = await async_fetch_billboard_song(entry)
             songs.append(song)
         
         response_data = {
             "data": songs,
             "metadata": {
-                "current_page": page,
-                "per_page": per_page,
                 "total_items": len(chart),
-                "total_pages": -(-len(chart) // per_page),  # Ceiling division
-                "has_next": end_index < len(chart)
+                "chart_date": chart.date,  # Include chart date for reference
+                "last_updated": datetime.now().isoformat()
             }
         }
         
-        cache.set(cache_key, response_data, timeout=3600)  # Cache for 1 hour
-        
-        # Prefetch next page
-        if response_data["metadata"]["has_next"]:
-            asyncio.create_task(prefetch_next_page(page + 1, per_page, chart))
+        # Cache for 7 days (Billboard updates weekly on Tuesdays)
+        cache.set(cache_key, response_data, timeout=604800)  # 7 days = 604800 seconds
         
         return jsonify(response_data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-async def prefetch_next_page(next_page, per_page, chart):
-    cache_key = f"billboard_page_{next_page}"
-    if cache.get(cache_key):
-        return  # Next page already cached
-    
-    start_index = (next_page - 1) * per_page
-    end_index = start_index + per_page
-    
-    songs = []
-    for entry in chart[start_index:end_index]:
-        song = await async_fetch_billboard_song(entry)
-        songs.append(song)
-    
-    response_data = {
-        "data": songs,
-        "metadata": {
-            "current_page": next_page,
-            "per_page": per_page,
-            "total_items": len(chart),
-            "total_pages": -(-len(chart) // per_page),
-            "has_next": end_index < len(chart)
-        }
-    }
-    
-    cache.set(cache_key, response_data, timeout=3600) 
+
 
 # album endpoint
 @app.route("/album/<album_id>", methods=["GET"])
