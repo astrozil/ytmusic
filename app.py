@@ -18,11 +18,13 @@ from redis import from_url as redis_from_url
 
 
 app = Flask(__name__)
+redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+
 app.config.update({
-    'CACHE_TYPE': 'RedisCache',  # Use Redis for production
-    'CACHE_REDIS_URL': 'redis://localhost:6379/0',
-    'CACHE_DEFAULT_TIMEOUT': 86400,  # 24 hours default
-    'CACHE_THRESHOLD': 5000,  # Higher threshold to prevent premature eviction
+    'CACHE_TYPE': 'RedisCache',
+    'CACHE_REDIS_URL': redis_url,
+    'CACHE_DEFAULT_TIMEOUT': 86400,
+    'CACHE_THRESHOLD': 5000,
     'CACHE_KEY_PREFIX': 'ytmusic_api_'
 })
 cache = Cache(app)
