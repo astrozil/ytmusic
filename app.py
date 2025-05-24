@@ -27,6 +27,20 @@ def make_daily_cache_key():
     artist_ids_param = request.args.get("artists", "")
     limit_param = request.args.get("limit", "50")
     return f"mix_daily_{current_date}_{artist_ids_param}_{limit_param}"
+def make_recommendations_cache_key():
+    """Generate a cache key for recommendations that includes the current date and song_ids"""
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    
+    # Get song_ids from request body
+    data = request.get_json()
+    song_ids = data.get('song_ids', []) if data else []
+    
+    # Sort song_ids to ensure consistent cache keys regardless of order
+    sorted_song_ids = sorted(song_ids)
+    song_ids_str = ','.join(sorted_song_ids)
+    
+    return f"recommendations_daily_{current_date}_{hash(song_ids_str)}"
+
 
 def patched_get(url, *args, **kwargs):
     headers = kwargs.get("headers", {})
@@ -647,6 +661,16 @@ def get_recommendations():
     if not isinstance(song_ids, list) or len(song_ids) < 1 or len(song_ids) > 50:
         abort(400, description="song_ids must be a list containing 1 to 50 song IDs")
     
+    # Generate cache key
+    cache_key = make_recommendations_cache_key()
+    
+    # Check cache first
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        logger.info(f"Returning cached recommendations for key: {cache_key}")
+        return jsonify(cached_data)
+    
+    # If not in cache, generate recommendations
     all_tracks = []
     with ThreadPoolExecutor(max_workers=10) as executor:
         # Create a future for each song ID
@@ -696,14 +720,12 @@ def get_recommendations():
         random.shuffle(frequency_groups[count])
     
     # Rebuild the list with some randomness
-    # Option 1: More randomness - randomly select from different frequency groups
     result_tracks = []
     counts = sorted(frequency_groups.keys(), reverse=True)
     
     # Ensure we get tracks from all frequency groups
     while len(result_tracks) < 50 and frequency_groups:
         # Randomly select a frequency group with weighted probability
-        # Higher frequencies have higher chances of being selected
         weights = [c for c in counts if frequency_groups[c]]
         if not weights:
             break
@@ -732,7 +754,15 @@ def get_recommendations():
         random.shuffle(remaining_tracks)
         result_tracks.extend(remaining_tracks[:50-len(result_tracks)])
     
-    return jsonify(result_tracks[:50])
+    final_result = result_tracks[:50]
+    
+    # Cache the result for 24 hours (86400 seconds)
+    cache.set(cache_key, final_result, timeout=86400)
+    logger.info(f"Cached recommendations for key: {cache_key}")
+    
+    return jsonify(final_result)
+
+
 # search Suggestion endpoint
 @app.route("/search_suggestions", methods=["GET"])
 def get_search_suggestions():
