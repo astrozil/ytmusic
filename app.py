@@ -163,6 +163,7 @@ def get_artist_details(artist_id):
     except Exception as e:
         logger.error(f"Error fetching artist details: {e}")
         abort(500, description="An error occurred while processing your request")
+
 @app.route("/artist/<artist_id>/songs", methods=["GET"])
 def get_artist_songs(artist_id):
     if not artist_id or not isinstance(artist_id, str):
@@ -182,18 +183,22 @@ def get_artist_songs(artist_id):
                     album_id = item.get('browseId')
                     if album_id:
                         try:
+                            # Initialize album_details properly
+                            album_details = None
                             album_details = ytmusic.get_album(album_id)
-                            # Extract relevant track information
-                            for track in album_details.get('tracks', []):
-                                simplified_track = {
-                                    "title": track.get('title'),
-                                    "videoId": track.get('videoId'),
-                                    "artist": track.get('artists')[0].get('name') if track.get('artists') else None,
-                                    "album": album_details.get('title'),
-                                    "duration": track.get('duration'),
-                                    "year": album_details.get('year')
-                                }
-                                all_songs.append(simplified_track)
+                            
+                            if album_details:  # Check if album_details is not None
+                                # Extract relevant track information
+                                for track in album_details.get('tracks', []):
+                                    simplified_track = {
+                                        "title": track.get('title'),
+                                        "videoId": track.get('videoId'),
+                                        "artist": track.get('artists')[0].get('name') if track.get('artists') else None,
+                                        "album": album_details.get('title'),
+                                        "duration": track.get('duration'),
+                                        "year": album_details.get('year')
+                                    }
+                                    all_songs.append(simplified_track)
                         except Exception as e:
                             logger.error(f"Error processing album {album_id}: {e}")
                             continue
@@ -212,6 +217,8 @@ def get_artist_songs(artist_id):
     except Exception as e:
         logger.error(f"Error fetching artist songs: {e}")
         abort(500, description="An error occurred while processing your request")
+
+
 # Trending songs endpoint
 
 
@@ -408,6 +415,7 @@ def mix_songs():
         if "songs" in artist_info:
             songs_data = artist_info["songs"]
             songs_browse_id = songs_data.get("browseId")
+            
             if songs_browse_id:
                 try:
                     playlist_data = ytmusic.get_playlist(songs_browse_id)
@@ -428,7 +436,7 @@ def mix_songs():
                             "title": track.get("title"),
                             "videoId": track.get("videoId"),
                             "artists": artists,
-                            "album": None,  # Album info might not be provided here.
+                            "album": None,
                             "duration": track.get("duration"),
                             "thumbnails": format_thumbnails(raw_thumbnails)
                         })
@@ -457,11 +465,12 @@ def mix_songs():
                         "thumbnails": format_thumbnails(raw_thumbnails)
                     })
         
-        # Handle albums and singles: use get_artist_albums with the provided params.
+        # Handle albums and singles with improved error handling
         for content_type in ["albums", "singles"]:
             if content_type in artist_info:
                 content_data = artist_info[content_type]
                 params = content_data.get("params")
+                
                 if params:
                     try:
                         releases = ytmusic.get_artist_albums(artist_id, params)
@@ -470,35 +479,38 @@ def mix_songs():
                             if album_id:
                                 try:
                                     album_info = ytmusic.get_album(album_id)
-                                    # Use album thumbnails as a fallback if track thumbnails are not available.
-                                    album_thumbnails = album_info.get("thumbnails", [])
-                                    for track in album_info.get("tracks", []):
-                                        raw_thumbnails = track.get("thumbnails") or album_thumbnails
-                                        if track.get("artists"):
-                                            artists = [
-                                                {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
-                                                for a in track.get("artists")
-                                            ]
-                                        elif album_info.get("artists"):
-                                            artists = [
-                                                {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
-                                                for a in album_info.get("artists")
-                                            ]
-                                        else:
-                                            artists = []
-                                        
-                                        all_songs.append({
-                                            "title": track.get("title"),
-                                            "videoId": track.get("videoId"),
-                                            "artists": artists,
-                                            "album": album_info.get("title"),
-                                            "duration": track.get("duration"),
-                                            "thumbnails": format_thumbnails(raw_thumbnails)
-                                        })
+                                    if album_info:  # Ensure album_info is not None
+                                        album_thumbnails = album_info.get("thumbnails", [])
+                                        for track in album_info.get("tracks", []):
+                                            raw_thumbnails = track.get("thumbnails") or album_thumbnails
+                                            if track.get("artists"):
+                                                artists = [
+                                                    {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
+                                                    for a in track.get("artists")
+                                                ]
+                                            elif album_info.get("artists"):
+                                                artists = [
+                                                    {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
+                                                    for a in album_info.get("artists")
+                                                ]
+                                            else:
+                                                artists = []
+                                            
+                                            all_songs.append({
+                                                "title": track.get("title"),
+                                                "videoId": track.get("videoId"),
+                                                "artists": artists,
+                                                "album": album_info.get("title"),
+                                                "duration": track.get("duration"),
+                                                "thumbnails": format_thumbnails(raw_thumbnails)
+                                            })
                                 except Exception as e:
                                     logger.error(f"Error fetching album {album_id}: {e}")
+                                    continue
                     except Exception as e:
                         logger.error(f"Error fetching {content_type} for artist {artist_id}: {e}")
+                        # Continue processing other content types
+                        continue
 
     # Remove duplicates while preserving order.
     seen = set()
