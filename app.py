@@ -475,8 +475,10 @@ def format_thumbnails(thumbnails):
     return formatted
 
 @app.route("/mix", methods=["GET"])
-
 def mix_songs():
+    import random
+    from collections import defaultdict
+    
     # Generate cache key
     cache_key = make_daily_cache_key()
     
@@ -485,6 +487,7 @@ def mix_songs():
     if cached_data:
         logger.info(f"Returning cached mix data for key: {cache_key}")
         return jsonify(cached_data)
+    
     artist_ids_param = request.args.get("artists")
     limit_param = request.args.get("limit", "50")
     
@@ -500,17 +503,18 @@ def mix_songs():
         limit = 50
     
     artist_ids = [x.strip() for x in artist_ids_param.split(",")]
-    all_songs = []
-
-    # [Keep all your existing song fetching logic - no changes needed]
+    all_songs_by_artist = {}  # Store songs grouped by artist
+    
+    # Collect songs for each artist separately
     for artist_id in artist_ids:
+        artist_songs = []
         try:
             artist_info = ytmusic.get_artist(artist_id)
         except Exception as e:
             logger.error(f"Error retrieving artist {artist_id}: {e}")
             continue
         
-        # Handle 'songs' key: these are the artist's top songs/videos.
+        # Handle 'songs' key: these are the artist's top songs/videos
         if "songs" in artist_info:
             songs_data = artist_info["songs"]
             songs_browse_id = songs_data.get("browseId")
@@ -529,7 +533,7 @@ def mix_songs():
                         else:
                             artists = []
                         
-                        all_songs.append({
+                        artist_songs.append({
                             "title": track.get("title"),
                             "videoId": track.get("videoId"),
                             "artists": artists,
@@ -552,7 +556,7 @@ def mix_songs():
                     else:
                         artists = []
                     
-                    all_songs.append({
+                    artist_songs.append({
                         "title": song.get("title"),
                         "videoId": song.get("videoId"),
                         "artists": artists,
@@ -590,7 +594,7 @@ def mix_songs():
                                         else:
                                             artists = []
                                         
-                                        all_songs.append({
+                                        artist_songs.append({
                                             "title": track.get("title"),
                                             "videoId": track.get("videoId"),
                                             "artists": artists,
@@ -602,23 +606,80 @@ def mix_songs():
                                     logger.error(f"Error fetching album {album_id}: {e}")
                     except Exception as e:
                         logger.error(f"Error fetching {content_type} for artist {artist_id}: {e}")
+        
+        # Remove duplicates for this artist
+        seen = set()
+        unique_artist_songs = []
+        for song in artist_songs:
+            identifier = song.get("videoId") or song.get("title")
+            if identifier and identifier not in seen:
+                seen.add(identifier)
+                unique_artist_songs.append(song)
+        
+        # Shuffle this artist's songs and store them
+        random.shuffle(unique_artist_songs)
+        all_songs_by_artist[artist_id] = unique_artist_songs
 
-    # Remove duplicates while preserving order.
-    seen = set()
-    unique_songs = []
-    for song in all_songs:
-        identifier = song.get("videoId") or song.get("title")
-        if identifier and identifier not in seen:
-            seen.add(identifier)
-            unique_songs.append(song)
-    result = unique_songs[:limit]
-    # Shuffle the list so that songs from different artists are mixed.
-    random.shuffle(result)
+    # **BEST METHOD: Balanced Round-Robin Selection**
+    def create_balanced_mix(songs_by_artist, total_limit):
+        """
+        Creates a balanced mix by distributing songs evenly across artists
+        using a round-robin approach.
+        """
+        if not songs_by_artist:
+            return []
+        
+        # Calculate songs per artist for balanced distribution
+        num_artists = len(songs_by_artist)
+        base_songs_per_artist = total_limit // num_artists
+        extra_songs = total_limit % num_artists
+        
+        result = []
+        artist_indices = {artist_id: 0 for artist_id in songs_by_artist.keys()}
+        artists_list = list(songs_by_artist.keys())
+        
+        # First pass: Give each artist their base allocation
+        for round_num in range(base_songs_per_artist):
+            for artist_id in artists_list:
+                songs = songs_by_artist[artist_id]
+                if artist_indices[artist_id] < len(songs):
+                    result.append(songs[artist_indices[artist_id]])
+                    artist_indices[artist_id] += 1
+        
+        # Second pass: Distribute remaining songs
+        artist_idx = 0
+        for _ in range(extra_songs):
+            while artist_idx < len(artists_list):
+                artist_id = artists_list[artist_idx]
+                songs = songs_by_artist[artist_id]
+                if artist_indices[artist_id] < len(songs):
+                    result.append(songs[artist_indices[artist_id]])
+                    artist_indices[artist_id] += 1
+                    artist_idx += 1
+                    break
+                artist_idx += 1
+        
+        # Final shuffle to mix the order while maintaining balance
+        random.shuffle(result)
+        return result[:total_limit]
+
+    # Create balanced mix
+    result = create_balanced_mix(all_songs_by_artist, limit)
+    
+    # Log artist distribution for debugging
+    artist_count = defaultdict(int)
+    for song in result:
+        for artist in song.get('artists', []):
+            artist_name = artist.get('name', 'Unknown')
+            artist_count[artist_name] += 1
+    
+    logger.info(f"Artist distribution in mix: {dict(artist_count)}")
+    
+    # Cache the result
     cache.set(cache_key, result, timeout=get_seconds_until_midnight())
     logger.info(f"Cached mix data for key: {cache_key}")
-    # Return limited results (default 50)
+    
     return jsonify(result)
-#favourite songs fetch 
 
 def transform_song_data(song_data):
     """
