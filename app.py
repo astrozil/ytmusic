@@ -459,9 +459,6 @@ def get_album_details(album_id):
         abort(500, description="An error occurred while processing your request")
 
 # Mix Endpoint
-
-
-
 def format_thumbnails(thumbnails):
     """
     Format a list of thumbnails to include only height, url, and width.
@@ -616,7 +613,7 @@ def mix_songs():
             unique_songs.append(song)
     result = unique_songs[:limit]
     # Shuffle the list so that songs from different artists are mixed.
-    random.shuffle(unique_songs)
+    random.shuffle(result)
     cache.set(cache_key, result, timeout=get_seconds_until_midnight())
     logger.info(f"Cached mix data for key: {cache_key}")
     # Return limited results (default 50)
