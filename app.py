@@ -884,7 +884,117 @@ def get_search_suggestions():
     except Exception as e:
         logger.error(f"Error fetching search suggestions: {e}")
         abort(500, description="An error occurred while processing your request")
-
+# Multiple artists endpoint
+@app.route("/artists", methods=["POST"])
+def get_multiple_artists():
+    """
+    Fetch multiple artists' basic information including high quality thumbnail, name, and browseId
+    Expected input: {"artist_ids": ["browseId1", "browseId2", ...]}
+    """
+    data = request.get_json()
+    
+    if not data or 'artist_ids' not in data:
+        abort(400, description="Missing 'artist_ids' in request body")
+    
+    artist_ids = data['artist_ids']
+    
+    if not isinstance(artist_ids, list):
+        abort(400, description="artist_ids must be a list")
+    
+    if len(artist_ids) == 0:
+        abort(400, description="artist_ids list cannot be empty")
+    
+    if len(artist_ids) > 50:  # Reasonable limit to prevent abuse
+        abort(400, description="Maximum 50 artist IDs allowed per request")
+    
+    # Validate that all items in the list are strings
+    for artist_id in artist_ids:
+        if not isinstance(artist_id, str) or not artist_id.strip():
+            abort(400, description="All artist IDs must be non-empty strings")
+    
+    def fetch_artist_info(artist_id):
+        """Helper function to fetch individual artist info"""
+        try:
+            artist_details = ytmusic.get_artist(artist_id)
+            
+            # Get the highest quality thumbnail
+            thumbnails = artist_details.get('thumbnails', [])
+            high_quality_thumbnail = None
+            
+            if thumbnails:
+                # Sort by resolution (width * height) to get the highest quality
+                sorted_thumbnails = sorted(
+                    thumbnails, 
+                    key=lambda x: (x.get('width', 0) * x.get('height', 0)), 
+                    reverse=True
+                )
+                high_quality_thumbnail = {
+                    "url": sorted_thumbnails[0].get('url'),
+                    "width": sorted_thumbnails[0].get('width'),
+                    "height": sorted_thumbnails[0].get('height')
+                }
+            
+            return {
+                "browseId": artist_id,
+                "name": artist_details.get('name'),
+                "thumbnail": high_quality_thumbnail,
+                "success": True
+            }
+            
+        except Exception as e:
+            logger.error(f"Error fetching artist {artist_id}: {e}")
+            return {
+                "browseId": artist_id,
+                "name": None,
+                "thumbnail": None,
+                "success": False,
+                "error": str(e)
+            }
+    
+    # Use ThreadPoolExecutor for concurrent requests
+    artists_data = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit all tasks
+        future_to_artist = {
+            executor.submit(fetch_artist_info, artist_id): artist_id 
+            for artist_id in artist_ids
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_artist):
+            artist_result = future.result()
+            artists_data.append(artist_result)
+    
+    # Sort results to match the input order
+    id_to_result = {result['browseId']: result for result in artists_data}
+    ordered_results = [id_to_result[artist_id] for artist_id in artist_ids]
+    
+    # Separate successful and failed requests for better response structure
+    successful_artists = [artist for artist in ordered_results if artist['success']]
+    failed_artists = [artist for artist in ordered_results if not artist['success']]
+    
+    # Clean up successful results (remove success flag and error field)
+    for artist in successful_artists:
+        artist.pop('success', None)
+        artist.pop('error', None)
+    
+    response_data = {
+        "artists": successful_artists,
+        "total_requested": len(artist_ids),
+        "total_successful": len(successful_artists),
+        "total_failed": len(failed_artists)
+    }
+    
+    # Include failed requests info if any
+    if failed_artists:
+        response_data["failed_requests"] = [
+            {
+                "browseId": artist['browseId'],
+                "error": artist['error']
+            } for artist in failed_artists
+        ]
+    
+    return jsonify(response_data)
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
