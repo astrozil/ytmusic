@@ -1,12 +1,28 @@
 import asyncio
+import threading
 import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from cache_layer import CacheLayer, key_for_billboard
 from services.hot_endpoints import HotEndpointsService
 
 
 class ServiceFakeClients:
+    def __init__(self, sleep_get_charts=0.0):
+        self.sleep_get_charts = sleep_get_charts
+        self.method_counts = defaultdict(int)
+        self.watch_playlist_counts = defaultdict(int)
+        self.artist_counts = defaultdict(int)
+        self.lock = threading.Lock()
+
     def call_ytmusic(self, method_name, *args, **kwargs):
+        with self.lock:
+            self.method_counts[method_name] += 1
+
         if method_name == "get_charts":
+            if self.sleep_get_charts > 0:
+                time.sleep(self.sleep_get_charts)
             items = [
                 {"title": f"title-{i}", "artists": [{"name": "artist-a"}]}
                 for i in range(100)
@@ -22,6 +38,8 @@ class ServiceFakeClients:
 
         if method_name == "get_watch_playlist":
             seed = args[0]
+            with self.lock:
+                self.watch_playlist_counts[seed] += 1
             if seed == "bad-seed":
                 raise RuntimeError("seed failed")
             return {
@@ -32,10 +50,59 @@ class ServiceFakeClients:
             }
 
         if method_name == "get_artist":
-            return {"songs": {"results": []}}
+            artist_id = args[0]
+            with self.lock:
+                self.artist_counts[artist_id] += 1
+            return {
+                "songs": {
+                    "results": [
+                        {
+                            "title": f"{artist_id}-song",
+                            "videoId": f"{artist_id}-song-id",
+                            "artists": [{"id": artist_id, "name": artist_id}],
+                            "album": None,
+                            "duration": "3:00",
+                            "thumbnails": [],
+                        }
+                    ]
+                },
+                "albums": {"params": f"params-{artist_id}"},
+            }
 
-        if method_name in {"get_playlist", "get_artist_albums", "get_album"}:
-            return {}
+        if method_name == "get_playlist":
+            playlist_id = args[0]
+            return {
+                "tracks": [
+                    {
+                        "title": f"{playlist_id}-track",
+                        "videoId": f"{playlist_id}-track-id",
+                        "artists": [{"id": "artist-a", "name": "artist-a"}],
+                        "duration": "3:00",
+                        "thumbnails": [],
+                    }
+                ]
+            }
+
+        if method_name == "get_artist_albums":
+            artist_id = args[0]
+            return [{"browseId": f"album-{artist_id}-1"}]
+
+        if method_name == "get_album":
+            album_id = args[0]
+            return {
+                "title": f"title-{album_id}",
+                "thumbnails": [],
+                "artists": [{"id": "artist-a", "name": "artist-a"}],
+                "tracks": [
+                    {
+                        "title": f"{album_id}-track",
+                        "videoId": f"{album_id}-track-id",
+                        "artists": [{"id": "artist-a", "name": "artist-a"}],
+                        "duration": "3:00",
+                        "thumbnails": [],
+                    }
+                ],
+            }
 
         raise RuntimeError(f"Unexpected ytmusic call: {method_name}")
 
@@ -98,6 +165,27 @@ def test_trending_limit_capped_to_50_and_cache_normalized(settings_factory):
     assert stale_flag_2 is False
 
 
+def test_singleflight_prevents_duplicate_trending_fetches(settings_factory):
+    settings = settings_factory()
+    from flask import Flask
+
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    fake_clients = ServiceFakeClients(sleep_get_charts=0.2)
+    service = HotEndpointsService(fake_clients, cache_layer, settings, logger=flask_app.logger)
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        for _ in range(6):
+            futures.append(executor.submit(service.trending, "US", "1"))
+
+    results = [future.result() for future in as_completed(futures)]
+    assert fake_clients.method_counts["get_charts"] == 1
+    assert len(results) == 6
+    for payload, _, _ in results:
+        assert len(payload) == 1
+
+
 def test_recommendations_handles_partial_seed_failures(settings_factory):
     from flask import Flask
 
@@ -113,6 +201,38 @@ def test_recommendations_handles_partial_seed_failures(settings_factory):
     assert len(payload) <= 50
     assert state in {"miss", "hit"}
     assert stale_flag is False
+
+
+def test_recommendations_subcache_reuses_seed_watch_playlist_calls(settings_factory):
+    from flask import Flask
+
+    settings = settings_factory()
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    fake_clients = ServiceFakeClients()
+    service = HotEndpointsService(fake_clients, cache_layer, settings, logger=flask_app.logger)
+
+    service.recommendations(["seed-a"])
+    service.recommendations(["seed-a", "seed-b"])
+
+    assert fake_clients.watch_playlist_counts["seed-a"] == 1
+    assert fake_clients.watch_playlist_counts["seed-b"] == 1
+
+
+def test_mix_subcache_reuses_artist_fanout_calls(settings_factory):
+    from flask import Flask
+
+    settings = settings_factory()
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    fake_clients = ServiceFakeClients()
+    service = HotEndpointsService(fake_clients, cache_layer, settings, logger=flask_app.logger)
+
+    service.mix(["artist-a"], 10)
+    service.mix(["artist-a", "artist-b"], 10)
+
+    assert fake_clients.artist_counts["artist-a"] == 1
+    assert fake_clients.artist_counts["artist-b"] == 1
 
 
 def test_mix_route_missing_artists_and_schema(settings_factory):

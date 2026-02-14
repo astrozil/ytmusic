@@ -1,3 +1,4 @@
+import atexit
 import logging
 import os
 import re
@@ -12,6 +13,7 @@ from cache_layer import CacheLayer
 from clients import UpstreamClients
 from errors import register_error_handlers, register_request_hooks
 from services.hot_endpoints import HotEndpointsService
+from services.prewarm import PrewarmManager
 from settings import Settings
 
 
@@ -145,6 +147,15 @@ def create_app(
     app.extensions["ytmusic_cache_layer"] = cache_layer
     app.extensions["ytmusic_clients"] = clients
     app.extensions["ytmusic_hot_service"] = hot_service
+
+    prewarm_manager = PrewarmManager(
+        hot_service_getter=get_hot_service,
+        settings=settings_obj,
+        logger=logger,
+    )
+    app.extensions["ytmusic_prewarm_manager"] = prewarm_manager
+    prewarm_manager.start()
+    atexit.register(prewarm_manager.stop)
 
     register_request_hooks(app, logger)
     register_error_handlers(app, logger)
@@ -505,6 +516,7 @@ def create_app(
                     "status": "healthy",
                     "cache": cache_layer.health_snapshot(),
                     "rate_limits": {"enabled": settings_obj.enable_rate_limits},
+                    "prewarm": prewarm_manager.snapshot(),
                 }
             ),
             200,

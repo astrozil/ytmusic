@@ -32,6 +32,37 @@ def parse_float(value, default, minimum=None, maximum=None):
     return parsed
 
 
+def parse_csv_tokens(value):
+    if value is None:
+        return []
+    return [token.strip() for token in str(value).split(",") if token.strip()]
+
+
+def parse_country_list(value, fallback=("US",)):
+    tokens = parse_csv_tokens(value)
+    normalized = [token.upper() for token in tokens]
+    if not normalized:
+        return tuple(fallback)
+    return tuple(dict.fromkeys(normalized))
+
+
+def parse_limited_int_list(value, fallback=(50,), minimum=1, maximum=50):
+    tokens = parse_csv_tokens(value)
+    parsed = []
+    for token in tokens:
+        try:
+            int_value = int(token)
+        except ValueError:
+            continue
+        int_value = max(minimum, int_value)
+        int_value = min(maximum, int_value)
+        parsed.append(int_value)
+
+    if not parsed:
+        return tuple(fallback)
+    return tuple(dict.fromkeys(parsed))
+
+
 @dataclass(frozen=True)
 class Settings:
     cache_backend: str
@@ -58,10 +89,19 @@ class Settings:
     cache_ttl_recommendations_sec: int
     cache_ttl_mix_sec: int
     cache_ttl_billboard_sec: int
+    cache_ttl_subcache_seed_sec: int
+    cache_ttl_subcache_artist_sec: int
     cache_stale_trending_sec: int
     cache_stale_recommendations_sec: int
     cache_stale_mix_sec: int
     cache_stale_billboard_sec: int
+    cache_stale_subcache_seed_sec: int
+    cache_stale_subcache_artist_sec: int
+
+    enable_prewarm: bool
+    prewarm_loop_tick_sec: int
+    prewarm_trending_countries: tuple[str, ...]
+    prewarm_trending_limits: tuple[int, ...]
 
     enable_rate_limits: bool
     rate_limit_storage_uri: str
@@ -179,6 +219,16 @@ class Settings:
                 minimum=60,
             ),
             cache_ttl_billboard_sec=cache_ttl_billboard,
+            cache_ttl_subcache_seed_sec=parse_int(
+                os.getenv("CACHE_TTL_SUBCACHE_SEED_SEC", "21600"),
+                default=21600,
+                minimum=60,
+            ),
+            cache_ttl_subcache_artist_sec=parse_int(
+                os.getenv("CACHE_TTL_SUBCACHE_ARTIST_SEC", "21600"),
+                default=21600,
+                minimum=60,
+            ),
             cache_stale_trending_sec=parse_int(
                 os.getenv("CACHE_STALE_TRENDING_SEC", "43200"),
                 default=43200,
@@ -195,6 +245,36 @@ class Settings:
                 minimum=300,
             ),
             cache_stale_billboard_sec=cache_stale_billboard,
+            cache_stale_subcache_seed_sec=parse_int(
+                os.getenv("CACHE_STALE_SUBCACHE_SEED_SEC", "86400"),
+                default=86400,
+                minimum=300,
+            ),
+            cache_stale_subcache_artist_sec=parse_int(
+                os.getenv("CACHE_STALE_SUBCACHE_ARTIST_SEC", "86400"),
+                default=86400,
+                minimum=300,
+            ),
+            enable_prewarm=parse_bool(
+                os.getenv("ENABLE_PREWARM", "false"),
+                default=False,
+            ),
+            prewarm_loop_tick_sec=parse_int(
+                os.getenv("PREWARM_LOOP_TICK_SEC", "30"),
+                default=30,
+                minimum=5,
+                maximum=300,
+            ),
+            prewarm_trending_countries=parse_country_list(
+                os.getenv("PREWARM_TRENDING_COUNTRIES", "US"),
+                fallback=("US",),
+            ),
+            prewarm_trending_limits=parse_limited_int_list(
+                os.getenv("PREWARM_TRENDING_LIMITS", "50"),
+                fallback=(50,),
+                minimum=1,
+                maximum=50,
+            ),
             enable_rate_limits=parse_bool(
                 os.getenv("ENABLE_RATE_LIMITS", "true"),
                 default=True,

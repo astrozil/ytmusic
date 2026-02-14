@@ -25,10 +25,18 @@ def settings_factory(monkeypatch):
             "CACHE_TTL_RECOMMENDATIONS_SEC": "60",
             "CACHE_TTL_MIX_SEC": "60",
             "CACHE_TTL_BILLBOARD_SEC": "60",
+            "CACHE_TTL_SUBCACHE_SEED_SEC": "60",
+            "CACHE_TTL_SUBCACHE_ARTIST_SEC": "60",
             "CACHE_STALE_TRENDING_SEC": "120",
             "CACHE_STALE_RECOMMENDATIONS_SEC": "120",
             "CACHE_STALE_MIX_SEC": "120",
             "CACHE_STALE_BILLBOARD_SEC": "120",
+            "CACHE_STALE_SUBCACHE_SEED_SEC": "120",
+            "CACHE_STALE_SUBCACHE_ARTIST_SEC": "120",
+            "ENABLE_PREWARM": "false",
+            "PREWARM_LOOP_TICK_SEC": "30",
+            "PREWARM_TRENDING_COUNTRIES": "US",
+            "PREWARM_TRENDING_LIMITS": "50",
         }
         defaults.update({key: str(value) for key, value in overrides.items()})
         for key, value in defaults.items():

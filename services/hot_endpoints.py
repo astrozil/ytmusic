@@ -1,5 +1,6 @@
 import asyncio
 import random
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ from cache_layer import (
     key_for_mix,
     key_for_recommendations,
     key_for_trending,
+    stable_sha256,
 )
 
 
@@ -43,38 +45,74 @@ class HotEndpointsService:
         self.cache_layer = cache_layer
         self.settings = settings
         self.logger = logger
+        self._singleflight_locks = {}
+        self._singleflight_lock_guard = threading.Lock()
+
+    def _get_singleflight_lock(self, cache_key):
+        with self._singleflight_lock_guard:
+            existing = self._singleflight_locks.get(cache_key)
+            if existing is not None:
+                return existing
+            lock = threading.Lock()
+            self._singleflight_locks[cache_key] = lock
+            return lock
+
+    def _subcache_key(self, namespace, key_data):
+        return f"subcache:{namespace}:{stable_sha256(key_data)}"
 
     def _with_cache_sync(self, cache_key, fresh_ttl, stale_ttl, fetch_fn):
         cached = self.cache_layer.get_envelope(cache_key)
         if cached.state == "hit":
             return cached.payload, "hit", False
 
-        try:
-            payload = fetch_fn()
-            self.cache_layer.set_envelope(cache_key, payload, fresh_ttl, stale_ttl)
-            return payload, "miss", False
-        except Exception as exc:
-            if cached.state == "stale" and self.settings.enable_stale_fallback:
-                self.logger.warning("Serving stale data for key '%s' due to: %s", cache_key, exc)
-                self.cache_layer.record_stale_served()
-                return cached.payload, "stale", True
-            raise
+        stale_payload = cached.payload if cached.state == "stale" else None
+        lock = self._get_singleflight_lock(cache_key)
+
+        with lock:
+            cached_after_lock = self.cache_layer.get_envelope(cache_key)
+            if cached_after_lock.state == "hit":
+                return cached_after_lock.payload, "hit", False
+            if cached_after_lock.state == "stale":
+                stale_payload = cached_after_lock.payload
+
+            try:
+                payload = fetch_fn()
+                self.cache_layer.set_envelope(cache_key, payload, fresh_ttl, stale_ttl)
+                return payload, "miss", False
+            except Exception as exc:
+                if stale_payload is not None and self.settings.enable_stale_fallback:
+                    self.logger.warning("Serving stale data for key '%s' due to: %s", cache_key, exc)
+                    self.cache_layer.record_stale_served()
+                    return stale_payload, "stale", True
+                raise
 
     async def _with_cache_async(self, cache_key, fresh_ttl, stale_ttl, fetch_coro):
         cached = self.cache_layer.get_envelope(cache_key)
         if cached.state == "hit":
             return cached.payload, "hit", False
 
+        stale_payload = cached.payload if cached.state == "stale" else None
+        lock = self._get_singleflight_lock(cache_key)
+        await asyncio.to_thread(lock.acquire)
         try:
-            payload = await fetch_coro()
-            self.cache_layer.set_envelope(cache_key, payload, fresh_ttl, stale_ttl)
-            return payload, "miss", False
-        except Exception as exc:
-            if cached.state == "stale" and self.settings.enable_stale_fallback:
-                self.logger.warning("Serving stale data for key '%s' due to: %s", cache_key, exc)
-                self.cache_layer.record_stale_served()
-                return cached.payload, "stale", True
-            raise
+            cached_after_lock = self.cache_layer.get_envelope(cache_key)
+            if cached_after_lock.state == "hit":
+                return cached_after_lock.payload, "hit", False
+            if cached_after_lock.state == "stale":
+                stale_payload = cached_after_lock.payload
+
+            try:
+                payload = await fetch_coro()
+                self.cache_layer.set_envelope(cache_key, payload, fresh_ttl, stale_ttl)
+                return payload, "miss", False
+            except Exception as exc:
+                if stale_payload is not None and self.settings.enable_stale_fallback:
+                    self.logger.warning("Serving stale data for key '%s' due to: %s", cache_key, exc)
+                    self.cache_layer.record_stale_served()
+                    return stale_payload, "stale", True
+                raise
+        finally:
+            lock.release()
 
     def get_trending_video_items(self, charts, limit):
         if isinstance(charts, dict):
@@ -157,12 +195,80 @@ class HotEndpointsService:
             fetch,
         )
 
-    def _fetch_recommendation_seed(self, song_id):
-        return self.clients.call_ytmusic(
-            "get_watch_playlist",
-            song_id,
-            timeout=self.settings.upstream_timeout_sec * 2,
+    def _with_subcache_sync(self, namespace, key_data, fetch_fn):
+        cache_key = self._subcache_key(namespace, key_data)
+        payload, _, _ = self._with_cache_sync(
+            cache_key=cache_key,
+            fresh_ttl=self.settings.cache_ttl_subcache_artist_sec,
+            stale_ttl=self.settings.cache_stale_subcache_artist_sec,
+            fetch_fn=fetch_fn,
         )
+        return payload
+
+    def _get_cached_watch_playlist(self, song_id):
+        cache_key = self._subcache_key(
+            "watch_playlist",
+            {"song_id": str(song_id).strip()},
+        )
+        payload, _, _ = self._with_cache_sync(
+            cache_key=cache_key,
+            fresh_ttl=self.settings.cache_ttl_subcache_seed_sec,
+            stale_ttl=self.settings.cache_stale_subcache_seed_sec,
+            fetch_fn=lambda: self.clients.call_ytmusic(
+                "get_watch_playlist",
+                song_id,
+                timeout=self.settings.upstream_timeout_sec * 2,
+            ),
+        )
+        return payload
+
+    def _get_cached_artist(self, artist_id):
+        return self._with_subcache_sync(
+            "artist",
+            {"artist_id": str(artist_id).strip()},
+            lambda: self.clients.call_ytmusic(
+                "get_artist",
+                artist_id,
+                timeout=self.settings.upstream_timeout_sec * 2,
+            ),
+        )
+
+    def _get_cached_playlist(self, playlist_id):
+        return self._with_subcache_sync(
+            "playlist",
+            {"playlist_id": str(playlist_id).strip()},
+            lambda: self.clients.call_ytmusic(
+                "get_playlist",
+                playlist_id,
+                timeout=self.settings.upstream_timeout_sec * 2,
+            ),
+        )
+
+    def _get_cached_artist_albums(self, artist_id, params):
+        return self._with_subcache_sync(
+            "artist_albums",
+            {"artist_id": str(artist_id).strip(), "params": str(params).strip()},
+            lambda: self.clients.call_ytmusic(
+                "get_artist_albums",
+                artist_id,
+                params,
+                timeout=self.settings.upstream_timeout_sec * 2,
+            ),
+        )
+
+    def _get_cached_album(self, album_id):
+        return self._with_subcache_sync(
+            "album",
+            {"album_id": str(album_id).strip()},
+            lambda: self.clients.call_ytmusic(
+                "get_album",
+                album_id,
+                timeout=self.settings.upstream_timeout_sec * 2,
+            ),
+        )
+
+    def _fetch_recommendation_seed(self, song_id):
+        return self._get_cached_watch_playlist(song_id)
 
     def recommendations(self, song_ids):
         cache_key = key_for_recommendations(song_ids)
@@ -180,8 +286,11 @@ class HotEndpointsService:
                         result = future.result(timeout=self.settings.upstream_timeout_sec * 2)
                         tracks = result.get("tracks", [])
                         for track in tracks:
-                            track["seedSongId"] = song_id
-                        all_tracks.extend(tracks)
+                            if not isinstance(track, dict):
+                                continue
+                            track_with_seed = dict(track)
+                            track_with_seed["seedSongId"] = song_id
+                            all_tracks.append(track_with_seed)
                     except Exception as exc:
                         self.logger.error("Error processing recommendation seed %s: %s", song_id, exc)
 
@@ -242,11 +351,7 @@ class HotEndpointsService:
     def _fetch_artist_songs(self, artist_id):
         artist_songs = []
         try:
-            artist_info = self.clients.call_ytmusic(
-                "get_artist",
-                artist_id,
-                timeout=self.settings.upstream_timeout_sec * 2,
-            )
+            artist_info = self._get_cached_artist(artist_id)
         except Exception as exc:
             self.logger.error("Error retrieving artist %s: %s", artist_id, exc)
             return []
@@ -256,11 +361,7 @@ class HotEndpointsService:
             songs_browse_id = songs_data.get("browseId")
             if songs_browse_id:
                 try:
-                    playlist_data = self.clients.call_ytmusic(
-                        "get_playlist",
-                        songs_browse_id,
-                        timeout=self.settings.upstream_timeout_sec * 2,
-                    )
+                    playlist_data = self._get_cached_playlist(songs_browse_id)
                     for track in playlist_data.get("tracks", []):
                         artist_songs.append(
                             {
@@ -295,12 +396,7 @@ class HotEndpointsService:
             if not params:
                 continue
             try:
-                releases = self.clients.call_ytmusic(
-                    "get_artist_albums",
-                    artist_id,
-                    params,
-                    timeout=self.settings.upstream_timeout_sec * 2,
-                )
+                releases = self._get_cached_artist_albums(artist_id, params)
             except Exception as exc:
                 self.logger.error("Error fetching %s for artist %s: %s", content_type, artist_id, exc)
                 continue
@@ -310,11 +406,7 @@ class HotEndpointsService:
                 if not album_id:
                     continue
                 try:
-                    album_info = self.clients.call_ytmusic(
-                        "get_album",
-                        album_id,
-                        timeout=self.settings.upstream_timeout_sec * 2,
-                    )
+                    album_info = self._get_cached_album(album_id)
                     album_thumbnails = album_info.get("thumbnails", [])
                     for track in album_info.get("tracks", []):
                         raw_thumbnails = track.get("thumbnails") or album_thumbnails
