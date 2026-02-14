@@ -74,6 +74,10 @@ class Settings:
     cache_key_prefix: str
     cache_jitter_pct: float
     enable_stale_fallback: bool
+    enable_distributed_singleflight: bool
+    distributed_singleflight_lock_ttl_sec: int
+    distributed_singleflight_wait_timeout_sec: float
+    distributed_singleflight_poll_ms: int
 
     upstream_timeout_sec: float
     upstream_retry_attempts: int
@@ -82,21 +86,34 @@ class Settings:
     max_workers_trending: int
     max_workers_recommendations: int
     max_workers_mix: int
+    max_workers_artist_songs: int
+    max_workers_songs: int
     max_concurrency_billboard: int
     max_concurrency_artist_lookup: int
 
     cache_ttl_trending_sec: int
     cache_ttl_recommendations_sec: int
     cache_ttl_mix_sec: int
+    cache_ttl_artist_songs_sec: int
+    cache_ttl_songs_sec: int
+    cache_ttl_lyrics_sec: int
     cache_ttl_billboard_sec: int
     cache_ttl_subcache_seed_sec: int
     cache_ttl_subcache_artist_sec: int
+    cache_ttl_subcache_song_sec: int
     cache_stale_trending_sec: int
     cache_stale_recommendations_sec: int
     cache_stale_mix_sec: int
+    cache_stale_artist_songs_sec: int
+    cache_stale_songs_sec: int
+    cache_stale_lyrics_sec: int
     cache_stale_billboard_sec: int
     cache_stale_subcache_seed_sec: int
     cache_stale_subcache_artist_sec: int
+    cache_stale_subcache_song_sec: int
+    cache_ttl_lyrics_negative_base_sec: int
+    cache_ttl_lyrics_negative_max_sec: int
+    cache_lyrics_negative_backoff_factor: float
 
     enable_prewarm: bool
     prewarm_loop_tick_sec: int
@@ -122,6 +139,28 @@ class Settings:
             os.getenv("CACHE_STALE_BILLBOARD_SEC", "1209600"),
             default=1209600,
             minimum=cache_ttl_billboard,
+        )
+        cache_ttl_lyrics = parse_int(
+            os.getenv("CACHE_TTL_LYRICS_SEC", "300"),
+            default=300,
+            minimum=30,
+        )
+        cache_stale_lyrics = parse_int(
+            os.getenv("CACHE_STALE_LYRICS_SEC", "900"),
+            default=900,
+            minimum=cache_ttl_lyrics,
+        )
+        cache_ttl_lyrics_negative_base = parse_int(
+            os.getenv("CACHE_TTL_LYRICS_NEGATIVE_BASE_SEC", "30"),
+            default=30,
+            minimum=5,
+            maximum=3600,
+        )
+        cache_ttl_lyrics_negative_max = parse_int(
+            os.getenv("CACHE_TTL_LYRICS_NEGATIVE_MAX_SEC", "300"),
+            default=300,
+            minimum=cache_ttl_lyrics_negative_base,
+            maximum=86400,
         )
 
         return cls(
@@ -154,6 +193,28 @@ class Settings:
             enable_stale_fallback=parse_bool(
                 os.getenv("ENABLE_STALE_FALLBACK", "true"),
                 default=True,
+            ),
+            enable_distributed_singleflight=parse_bool(
+                os.getenv("ENABLE_DISTRIBUTED_SINGLEFLIGHT", "true"),
+                default=True,
+            ),
+            distributed_singleflight_lock_ttl_sec=parse_int(
+                os.getenv("DISTRIBUTED_SINGLEFLIGHT_LOCK_TTL_SEC", "30"),
+                default=30,
+                minimum=1,
+                maximum=300,
+            ),
+            distributed_singleflight_wait_timeout_sec=parse_float(
+                os.getenv("DISTRIBUTED_SINGLEFLIGHT_WAIT_TIMEOUT_SEC", "8"),
+                default=8.0,
+                minimum=0.1,
+                maximum=60.0,
+            ),
+            distributed_singleflight_poll_ms=parse_int(
+                os.getenv("DISTRIBUTED_SINGLEFLIGHT_POLL_MS", "100"),
+                default=100,
+                minimum=10,
+                maximum=2000,
             ),
             upstream_timeout_sec=parse_float(
                 os.getenv("UPSTREAM_TIMEOUT_SEC", "6"),
@@ -191,6 +252,18 @@ class Settings:
                 minimum=1,
                 maximum=64,
             ),
+            max_workers_artist_songs=parse_int(
+                os.getenv("MAX_WORKERS_ARTIST_SONGS", "8"),
+                default=8,
+                minimum=1,
+                maximum=64,
+            ),
+            max_workers_songs=parse_int(
+                os.getenv("MAX_WORKERS_SONGS", "12"),
+                default=12,
+                minimum=1,
+                maximum=64,
+            ),
             max_concurrency_billboard=parse_int(
                 os.getenv("MAX_CONCURRENCY_BILLBOARD", "12"),
                 default=12,
@@ -218,6 +291,17 @@ class Settings:
                 default=21600,
                 minimum=60,
             ),
+            cache_ttl_artist_songs_sec=parse_int(
+                os.getenv("CACHE_TTL_ARTIST_SONGS_SEC", "21600"),
+                default=21600,
+                minimum=60,
+            ),
+            cache_ttl_songs_sec=parse_int(
+                os.getenv("CACHE_TTL_SONGS_SEC", "21600"),
+                default=21600,
+                minimum=60,
+            ),
+            cache_ttl_lyrics_sec=cache_ttl_lyrics,
             cache_ttl_billboard_sec=cache_ttl_billboard,
             cache_ttl_subcache_seed_sec=parse_int(
                 os.getenv("CACHE_TTL_SUBCACHE_SEED_SEC", "21600"),
@@ -226,6 +310,11 @@ class Settings:
             ),
             cache_ttl_subcache_artist_sec=parse_int(
                 os.getenv("CACHE_TTL_SUBCACHE_ARTIST_SEC", "21600"),
+                default=21600,
+                minimum=60,
+            ),
+            cache_ttl_subcache_song_sec=parse_int(
+                os.getenv("CACHE_TTL_SUBCACHE_SONG_SEC", "21600"),
                 default=21600,
                 minimum=60,
             ),
@@ -244,6 +333,17 @@ class Settings:
                 default=86400,
                 minimum=300,
             ),
+            cache_stale_artist_songs_sec=parse_int(
+                os.getenv("CACHE_STALE_ARTIST_SONGS_SEC", "86400"),
+                default=86400,
+                minimum=300,
+            ),
+            cache_stale_songs_sec=parse_int(
+                os.getenv("CACHE_STALE_SONGS_SEC", "86400"),
+                default=86400,
+                minimum=300,
+            ),
+            cache_stale_lyrics_sec=cache_stale_lyrics,
             cache_stale_billboard_sec=cache_stale_billboard,
             cache_stale_subcache_seed_sec=parse_int(
                 os.getenv("CACHE_STALE_SUBCACHE_SEED_SEC", "86400"),
@@ -254,6 +354,19 @@ class Settings:
                 os.getenv("CACHE_STALE_SUBCACHE_ARTIST_SEC", "86400"),
                 default=86400,
                 minimum=300,
+            ),
+            cache_stale_subcache_song_sec=parse_int(
+                os.getenv("CACHE_STALE_SUBCACHE_SONG_SEC", "86400"),
+                default=86400,
+                minimum=300,
+            ),
+            cache_ttl_lyrics_negative_base_sec=cache_ttl_lyrics_negative_base,
+            cache_ttl_lyrics_negative_max_sec=cache_ttl_lyrics_negative_max,
+            cache_lyrics_negative_backoff_factor=parse_float(
+                os.getenv("CACHE_LYRICS_NEGATIVE_BACKOFF_FACTOR", "2.0"),
+                default=2.0,
+                minimum=1.0,
+                maximum=8.0,
             ),
             enable_prewarm=parse_bool(
                 os.getenv("ENABLE_PREWARM", "false"),

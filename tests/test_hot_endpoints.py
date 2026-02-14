@@ -49,6 +49,26 @@ class ServiceFakeClients:
                 ]
             }
 
+        if method_name == "get_song":
+            song_id = args[0]
+            return {
+                "videoDetails": {
+                    "author": f"artist-{song_id}",
+                    "channelId": f"channel-{song_id}",
+                    "lengthSeconds": "120",
+                    "thumbnail": {"thumbnails": []},
+                    "title": f"title-{song_id}",
+                    "videoId": song_id,
+                    "isLive": False,
+                },
+                "microformat": {
+                    "microformatDataRenderer": {
+                        "category": "Music",
+                    }
+                },
+                "musicAnalytics": {"feedbackTokens": {"add": "add-token", "remove": "remove-token"}},
+            }
+
         if method_name == "get_artist":
             artist_id = args[0]
             with self.lock:
@@ -67,6 +87,16 @@ class ServiceFakeClients:
                     ]
                 },
                 "albums": {"params": f"params-{artist_id}"},
+                "sections": [
+                    {
+                        "title": "Albums",
+                        "items": [{"browseId": f"album-{artist_id}-1"}],
+                    },
+                    {
+                        "title": "Singles",
+                        "items": [{"browseId": f"album-{artist_id}-1"}],
+                    },
+                ],
             }
 
         if method_name == "get_playlist":
@@ -186,6 +216,86 @@ def test_singleflight_prevents_duplicate_trending_fetches(settings_factory):
         assert len(payload) == 1
 
 
+def test_distributed_singleflight_waits_for_leader_result(settings_factory):
+    from flask import Flask
+
+    settings = settings_factory()
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    service = HotEndpointsService(ServiceFakeClients(), cache_layer, settings, logger=flask_app.logger)
+    service._distributed_singleflight_enabled = True
+    service._distributed_singleflight_client = object()
+
+    def _never_fetch():
+        raise AssertionError("fetch_fn should not run for waiting follower")
+
+    service._try_acquire_distributed_lock = lambda cache_key, token: False
+    service._wait_for_distributed_refresh = (
+        lambda cache_key, stale_payload=None: ({"value": "leader"}, "hit", False)
+    )
+
+    payload, state, stale_flag = service._with_cache_sync("distributed:key", 60, 120, _never_fetch)
+
+    assert payload == {"value": "leader"}
+    assert state == "hit"
+    assert stale_flag is False
+
+
+def test_distributed_singleflight_releases_lock_when_leader_fetches(settings_factory):
+    from flask import Flask
+
+    settings = settings_factory()
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    service = HotEndpointsService(ServiceFakeClients(), cache_layer, settings, logger=flask_app.logger)
+    service._distributed_singleflight_enabled = True
+    service._distributed_singleflight_client = object()
+
+    release_calls = []
+    service._try_acquire_distributed_lock = lambda cache_key, token: True
+    service._release_distributed_lock = lambda cache_key, token: release_calls.append((cache_key, token))
+
+    payload, state, stale_flag = service._with_cache_sync(
+        "distributed:leader:key",
+        60,
+        120,
+        lambda: {"ok": True},
+    )
+
+    assert payload == {"ok": True}
+    assert state == "miss"
+    assert stale_flag is False
+    assert len(release_calls) == 1
+    assert release_calls[0][0] == "distributed:leader:key"
+
+
+def test_distributed_singleflight_async_waits_for_leader_result(settings_factory):
+    from flask import Flask
+
+    settings = settings_factory()
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    service = HotEndpointsService(ServiceFakeClients(), cache_layer, settings, logger=flask_app.logger)
+    service._distributed_singleflight_enabled = True
+    service._distributed_singleflight_client = object()
+
+    async def _never_fetch():
+        raise AssertionError("fetch_coro should not run for waiting follower")
+
+    service._try_acquire_distributed_lock = lambda cache_key, token: False
+    service._wait_for_distributed_refresh = (
+        lambda cache_key, stale_payload=None: ({"value": "leader-async"}, "hit", False)
+    )
+
+    payload, state, stale_flag = asyncio.run(
+        service._with_cache_async("distributed:async:key", 60, 120, _never_fetch)
+    )
+
+    assert payload == {"value": "leader-async"}
+    assert state == "hit"
+    assert stale_flag is False
+
+
 def test_recommendations_handles_partial_seed_failures(settings_factory):
     from flask import Flask
 
@@ -217,6 +327,77 @@ def test_recommendations_subcache_reuses_seed_watch_playlist_calls(settings_fact
 
     assert fake_clients.watch_playlist_counts["seed-a"] == 1
     assert fake_clients.watch_playlist_counts["seed-b"] == 1
+
+
+def test_artist_songs_is_cached_and_reuses_album_subcache(settings_factory):
+    from flask import Flask
+
+    settings = settings_factory()
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    fake_clients = ServiceFakeClients()
+    service = HotEndpointsService(fake_clients, cache_layer, settings, logger=flask_app.logger)
+
+    first_payload, first_state, first_stale_flag = service.artist_songs("artist-a")
+    second_payload, second_state, second_stale_flag = service.artist_songs("artist-a")
+
+    assert first_payload
+    assert first_state == "miss"
+    assert first_stale_flag is False
+    assert second_payload == first_payload
+    assert second_state == "hit"
+    assert second_stale_flag is False
+    assert fake_clients.method_counts["get_artist"] == 1
+    assert fake_clients.method_counts["get_album"] == 1
+
+    song = first_payload[0]
+    assert {"title", "videoId", "artist", "album", "duration", "year"}.issubset(song.keys())
+
+
+def test_songs_parallel_path_uses_song_subcache_and_batch_cache(settings_factory):
+    from flask import Flask
+
+    settings = settings_factory()
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    fake_clients = ServiceFakeClients()
+    service = HotEndpointsService(fake_clients, cache_layer, settings, logger=flask_app.logger)
+
+    def transform(song_data):
+        return {"videoId": song_data.get("videoDetails", {}).get("videoId")}
+
+    song_ids = ["song-a", "song-a", "song-b"]
+    first_payload, first_state, first_stale_flag = service.songs(song_ids, transform)
+    second_payload, second_state, second_stale_flag = service.songs(song_ids, transform)
+
+    assert first_state == "miss"
+    assert first_stale_flag is False
+    assert [item.get("videoId") for item in first_payload] == song_ids
+    assert second_payload == first_payload
+    assert second_state == "hit"
+    assert second_stale_flag is False
+    assert fake_clients.method_counts["get_song"] == 2
+
+
+def test_billboard_artist_search_subcache_reuses_lookup(settings_factory):
+    from flask import Flask
+
+    settings = settings_factory()
+    flask_app = Flask(__name__)
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    fake_clients = ServiceFakeClients()
+    service = HotEndpointsService(fake_clients, cache_layer, settings, logger=flask_app.logger)
+
+    async def _run():
+        artist_sem = asyncio.Semaphore(settings.max_concurrency_artist_lookup)
+        first = await service._resolve_artist("Artist Alpha", artist_sem)
+        second = await service._resolve_artist("  artist   alpha  ", artist_sem)
+        return first, second
+
+    first_result, second_result = asyncio.run(_run())
+
+    assert fake_clients.method_counts["search"] == 1
+    assert first_result["id"] == second_result["id"]
 
 
 def test_mix_subcache_reuses_artist_fanout_calls(settings_factory):

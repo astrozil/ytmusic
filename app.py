@@ -2,6 +2,7 @@ import atexit
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, abort, jsonify, request
@@ -9,7 +10,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from waitress import serve
 
-from cache_layer import CacheLayer
+from cache_layer import CacheLayer, stable_sha256
 from clients import UpstreamClients
 from errors import register_error_handlers, register_request_hooks
 from services.hot_endpoints import HotEndpointsService
@@ -45,6 +46,31 @@ def scrape_lyrics(clients, lyrics_url):
     except Exception as exc:
         logger.error("Lyrics fetch error: %s", exc)
         return None
+
+
+def normalize_lyrics_token(value):
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def key_for_lyrics(song_title, artist_name):
+    normalized_title = normalize_lyrics_token(song_title)
+    normalized_artist = normalize_lyrics_token(artist_name)
+    digest = stable_sha256({"title": normalized_title, "artist": normalized_artist})
+    return f"lyrics:{digest}"
+
+
+def key_for_lyrics_negative(song_title, artist_name):
+    return f"{key_for_lyrics(song_title, artist_name)}:negative"
+
+
+def lyrics_negative_backoff_ttl(settings_obj, failure_count):
+    safe_failure_count = max(1, int(failure_count))
+    raw_ttl = float(settings_obj.cache_ttl_lyrics_negative_base_sec) * (
+        float(settings_obj.cache_lyrics_negative_backoff_factor)
+        ** float(safe_failure_count - 1)
+    )
+    bounded_ttl = min(float(settings_obj.cache_ttl_lyrics_negative_max_sec), raw_ttl)
+    return max(1, int(bounded_ttl))
 
 
 def transform_song_data(song_data):
@@ -197,6 +223,28 @@ def create_app(
         ):
             abort(400, description="Title and artist parameters are required and must be strings")
 
+        lyrics_cache_key = key_for_lyrics(song_title, artist_name)
+        lyrics_negative_key = key_for_lyrics_negative(song_title, artist_name)
+
+        cached_lyrics = cache_layer.get_envelope(lyrics_cache_key)
+        if cached_lyrics.state in {"hit", "stale"} and isinstance(cached_lyrics.payload, dict):
+            payload = cached_lyrics.payload
+            if payload.get("lyrics"):
+                return jsonify(payload)
+
+        negative_state = cache_layer.cache_get_safe(lyrics_negative_key)
+        now_ts = int(time.time())
+        if isinstance(negative_state, dict):
+            next_retry_at = int(negative_state.get("next_retry_at", 0))
+            if now_ts < next_retry_at:
+                logger.info(
+                    "Lyrics negative cache hit for '%s' by '%s' (retry_after=%s)",
+                    song_title,
+                    artist_name,
+                    next_retry_at,
+                )
+                abort(404, description="Lyrics not found on Genius or fallback service")
+
         lyrics_url = format_genius_url(artist_name, song_title)
         lyrics = scrape_lyrics(get_clients(), lyrics_url)
 
@@ -211,10 +259,38 @@ def create_app(
                 logger.error("Fallback lyrics error: %s", exc)
 
         if not lyrics:
+            previous_failures = 0
+            if isinstance(negative_state, dict):
+                try:
+                    previous_failures = int(negative_state.get("failures", 0))
+                except (TypeError, ValueError):
+                    previous_failures = 0
+            failure_count = max(1, previous_failures + 1)
+            backoff_ttl = lyrics_negative_backoff_ttl(settings_obj, failure_count)
+            cache_layer.cache_set_safe(
+                lyrics_negative_key,
+                {
+                    "failures": failure_count,
+                    "next_retry_at": now_ts + backoff_ttl,
+                },
+                timeout=max(backoff_ttl, settings_obj.cache_ttl_lyrics_negative_max_sec),
+            )
             logger.warning("Lyrics not found for %s by %s", song_title, artist_name)
             abort(404, description="Lyrics not found on Genius or fallback service")
 
-        return jsonify({"song_title": song_title, "artist": artist_name, "lyrics": lyrics})
+        payload = {"song_title": song_title, "artist": artist_name, "lyrics": lyrics}
+        cache_layer.set_envelope(
+            lyrics_cache_key,
+            payload,
+            settings_obj.cache_ttl_lyrics_sec,
+            settings_obj.cache_stale_lyrics_sec,
+        )
+        cache_layer.cache_set_safe(
+            lyrics_negative_key,
+            {"failures": 0, "next_retry_at": 0},
+            timeout=1,
+        )
+        return jsonify(payload)
 
     @app.route("/related/<song_id>", methods=["GET"])
     def get_related_songs(song_id):
@@ -243,52 +319,8 @@ def create_app(
         if not artist_id or not isinstance(artist_id, str):
             abort(400, description="Artist ID is required and must be a string")
         try:
-            artist_details = get_clients().call_ytmusic(
-                "get_artist", artist_id, timeout=settings_obj.upstream_timeout_sec * 2
-            )
-            all_songs = []
-            for section in artist_details.get("sections", []):
-                section_title = section.get("title", "").lower()
-                if any(
-                    keyword in section_title
-                    for keyword in ["album", "single", "ep", "compilation"]
-                ):
-                    for item in section.get("items", []):
-                        album_id = item.get("browseId")
-                        if not album_id:
-                            continue
-                        try:
-                            album_details = get_clients().call_ytmusic(
-                                "get_album",
-                                album_id,
-                                timeout=settings_obj.upstream_timeout_sec * 2,
-                            )
-                            for track in album_details.get("tracks", []):
-                                all_songs.append(
-                                    {
-                                        "title": track.get("title"),
-                                        "videoId": track.get("videoId"),
-                                        "artist": (
-                                            track.get("artists")[0].get("name")
-                                            if track.get("artists")
-                                            else None
-                                        ),
-                                        "album": album_details.get("title"),
-                                        "duration": track.get("duration"),
-                                        "year": album_details.get("year"),
-                                    }
-                                )
-                        except Exception as exc:
-                            logger.error("Error processing album %s: %s", album_id, exc)
-
-            seen = set()
-            unique_songs = []
-            for song in all_songs:
-                identifier = song.get("videoId") or song.get("title")
-                if identifier and identifier not in seen:
-                    seen.add(identifier)
-                    unique_songs.append(song)
-            return jsonify(unique_songs)
+            payload, _, _ = get_hot_service().artist_songs(artist_id)
+            return jsonify(payload)
         except Exception as exc:
             logger.error("Error fetching artist songs: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -365,20 +397,12 @@ def create_app(
         song_ids = data.get("song_ids", [])
         if not song_ids or not isinstance(song_ids, list):
             abort(400, description="A list of song IDs is required.")
-
-        songs_data = []
-        for song_id in song_ids:
-            try:
-                song_data = get_clients().call_ytmusic("get_song", song_id)
-                transformed_data = transform_song_data(song_data)
-                if transformed_data:
-                    songs_data.append(transformed_data)
-                else:
-                    songs_data.append({"error": f"Failed to transform data for song ID {song_id}"})
-            except Exception as exc:
-                logger.error("Error fetching data for song ID %s: %s", song_id, exc)
-                songs_data.append({"error": f"Failed to fetch data for song ID {song_id}"})
-        return jsonify(songs_data)
+        try:
+            payload, _, _ = get_hot_service().songs(song_ids, transform_song_data)
+            return jsonify(payload)
+        except Exception as exc:
+            logger.error("Error fetching songs: %s", exc)
+            abort(500, description="An error occurred while processing your request")
 
     @app.route("/recommendations", methods=["POST"])
     @maybe_limit("60 per minute")

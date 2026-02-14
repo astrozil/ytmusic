@@ -1,11 +1,15 @@
 import asyncio
 import random
 import threading
+import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import billboard
+from redis import from_url as redis_from_url
+from redis.exceptions import RedisError
 
 from cache_layer import (
     key_for_billboard,
@@ -40,6 +44,12 @@ def parse_limit(value, default=50, minimum=1, maximum=50):
 
 
 class HotEndpointsService:
+    _DISTRIBUTED_UNLOCK_LUA = (
+        "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+        "return redis.call('DEL', KEYS[1]) "
+        "else return 0 end"
+    )
+
     def __init__(self, clients, cache_layer, settings, logger):
         self.clients = clients
         self.cache_layer = cache_layer
@@ -47,6 +57,13 @@ class HotEndpointsService:
         self.logger = logger
         self._singleflight_locks = {}
         self._singleflight_lock_guard = threading.Lock()
+        self._distributed_singleflight_client = None
+        self._distributed_singleflight_enabled = bool(
+            settings.enable_distributed_singleflight
+            and str(cache_layer.status.get("backend", "")).lower() == "redis"
+        )
+        if self._distributed_singleflight_enabled:
+            self._initialize_distributed_singleflight()
 
     def _get_singleflight_lock(self, cache_key):
         with self._singleflight_lock_guard:
@@ -59,6 +76,114 @@ class HotEndpointsService:
 
     def _subcache_key(self, namespace, key_data):
         return f"subcache:{namespace}:{stable_sha256(key_data)}"
+
+    def _initialize_distributed_singleflight(self):
+        try:
+            self._distributed_singleflight_client = redis_from_url(
+                self.settings.redis_url,
+                socket_connect_timeout=self.settings.cache_redis_connect_timeout,
+                socket_timeout=self.settings.cache_redis_connect_timeout,
+            )
+            self._distributed_singleflight_client.ping()
+            self.logger.info("Distributed single-flight enabled")
+        except (RedisError, OSError, ConnectionError, ValueError) as exc:
+            self.logger.warning(
+                "Distributed single-flight disabled due to Redis init failure: %s",
+                exc,
+            )
+            self._distributed_singleflight_enabled = False
+            self._distributed_singleflight_client = None
+
+    def _distributed_lock_key(self, cache_key):
+        return f"{self.settings.cache_key_prefix}singleflight:{cache_key}"
+
+    @staticmethod
+    def _new_distributed_lock_token():
+        return uuid.uuid4().hex
+
+    def _try_acquire_distributed_lock(self, cache_key, token):
+        if not self._distributed_singleflight_enabled:
+            return True
+        if self._distributed_singleflight_client is None:
+            return True
+
+        lock_key = self._distributed_lock_key(cache_key)
+        try:
+            acquired = self._distributed_singleflight_client.set(
+                lock_key,
+                token,
+                nx=True,
+                ex=int(self.settings.distributed_singleflight_lock_ttl_sec),
+            )
+            return bool(acquired)
+        except (RedisError, OSError, ConnectionError) as exc:
+            self.logger.warning(
+                "Distributed lock acquire failed for key '%s': %s",
+                cache_key,
+                exc,
+            )
+            return True
+        except Exception as exc:
+            self.logger.warning(
+                "Distributed lock acquire unexpected failure for key '%s': %s",
+                cache_key,
+                exc,
+            )
+            return True
+
+    def _release_distributed_lock(self, cache_key, token):
+        if not self._distributed_singleflight_enabled:
+            return
+        if self._distributed_singleflight_client is None:
+            return
+
+        lock_key = self._distributed_lock_key(cache_key)
+        try:
+            self._distributed_singleflight_client.eval(
+                self._DISTRIBUTED_UNLOCK_LUA,
+                1,
+                lock_key,
+                token,
+            )
+        except (RedisError, OSError, ConnectionError) as exc:
+            self.logger.warning(
+                "Distributed lock release failed for key '%s': %s",
+                cache_key,
+                exc,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Distributed lock release unexpected failure for key '%s': %s",
+                cache_key,
+                exc,
+            )
+
+    def _wait_for_distributed_refresh(self, cache_key, stale_payload=None):
+        poll_interval_sec = max(
+            0.01,
+            float(self.settings.distributed_singleflight_poll_ms) / 1000.0,
+        )
+        deadline = time.monotonic() + float(
+            self.settings.distributed_singleflight_wait_timeout_sec
+        )
+        latest_stale_payload = stale_payload
+
+        while time.monotonic() < deadline:
+            cached = self.cache_layer.get_envelope(cache_key)
+            if cached.state == "hit":
+                return cached.payload, "hit", False
+            if cached.state == "stale":
+                latest_stale_payload = cached.payload
+            time.sleep(poll_interval_sec)
+
+        if latest_stale_payload is not None and self.settings.enable_stale_fallback:
+            self.logger.warning(
+                "Serving stale data for key '%s' after distributed wait timeout",
+                cache_key,
+            )
+            self.cache_layer.record_stale_served()
+            return latest_stale_payload, "stale", True
+        return None
 
     def _with_cache_sync(self, cache_key, fresh_ttl, stale_ttl, fetch_fn):
         cached = self.cache_layer.get_envelope(cache_key)
@@ -75,6 +200,31 @@ class HotEndpointsService:
             if cached_after_lock.state == "stale":
                 stale_payload = cached_after_lock.payload
 
+            distributed_lock_token = None
+            distributed_lock_acquired = True
+            if self._distributed_singleflight_enabled:
+                distributed_lock_token = self._new_distributed_lock_token()
+                distributed_lock_acquired = self._try_acquire_distributed_lock(
+                    cache_key,
+                    distributed_lock_token,
+                )
+                if not distributed_lock_acquired:
+                    waited_result = self._wait_for_distributed_refresh(
+                        cache_key,
+                        stale_payload=stale_payload,
+                    )
+                    if waited_result is not None:
+                        return waited_result
+                    distributed_lock_acquired = self._try_acquire_distributed_lock(
+                        cache_key,
+                        distributed_lock_token,
+                    )
+                    if not distributed_lock_acquired:
+                        self.logger.warning(
+                            "Distributed lock wait timed out for key '%s'; proceeding locally",
+                            cache_key,
+                        )
+
             try:
                 payload = fetch_fn()
                 self.cache_layer.set_envelope(cache_key, payload, fresh_ttl, stale_ttl)
@@ -85,6 +235,13 @@ class HotEndpointsService:
                     self.cache_layer.record_stale_served()
                     return stale_payload, "stale", True
                 raise
+            finally:
+                if (
+                    self._distributed_singleflight_enabled
+                    and distributed_lock_acquired
+                    and distributed_lock_token is not None
+                ):
+                    self._release_distributed_lock(cache_key, distributed_lock_token)
 
     async def _with_cache_async(self, cache_key, fresh_ttl, stale_ttl, fetch_coro):
         cached = self.cache_layer.get_envelope(cache_key)
@@ -101,6 +258,34 @@ class HotEndpointsService:
             if cached_after_lock.state == "stale":
                 stale_payload = cached_after_lock.payload
 
+            distributed_lock_token = None
+            distributed_lock_acquired = True
+            if self._distributed_singleflight_enabled:
+                distributed_lock_token = self._new_distributed_lock_token()
+                distributed_lock_acquired = await asyncio.to_thread(
+                    self._try_acquire_distributed_lock,
+                    cache_key,
+                    distributed_lock_token,
+                )
+                if not distributed_lock_acquired:
+                    waited_result = await asyncio.to_thread(
+                        self._wait_for_distributed_refresh,
+                        cache_key,
+                        stale_payload,
+                    )
+                    if waited_result is not None:
+                        return waited_result
+                    distributed_lock_acquired = await asyncio.to_thread(
+                        self._try_acquire_distributed_lock,
+                        cache_key,
+                        distributed_lock_token,
+                    )
+                    if not distributed_lock_acquired:
+                        self.logger.warning(
+                            "Distributed lock wait timed out for key '%s'; proceeding locally",
+                            cache_key,
+                        )
+
             try:
                 payload = await fetch_coro()
                 self.cache_layer.set_envelope(cache_key, payload, fresh_ttl, stale_ttl)
@@ -111,6 +296,17 @@ class HotEndpointsService:
                     self.cache_layer.record_stale_served()
                     return stale_payload, "stale", True
                 raise
+            finally:
+                if (
+                    self._distributed_singleflight_enabled
+                    and distributed_lock_acquired
+                    and distributed_lock_token is not None
+                ):
+                    await asyncio.to_thread(
+                        self._release_distributed_lock,
+                        cache_key,
+                        distributed_lock_token,
+                    )
         finally:
             lock.release()
 
@@ -267,6 +463,42 @@ class HotEndpointsService:
             ),
         )
 
+    def _get_cached_song(self, song_id):
+        cache_key = self._subcache_key(
+            "song",
+            {"song_id": str(song_id).strip()},
+        )
+        payload, _, _ = self._with_cache_sync(
+            cache_key=cache_key,
+            fresh_ttl=self.settings.cache_ttl_subcache_song_sec,
+            stale_ttl=self.settings.cache_stale_subcache_song_sec,
+            fetch_fn=lambda: self.clients.call_ytmusic(
+                "get_song",
+                song_id,
+                timeout=self.settings.upstream_timeout_sec * 2,
+            ),
+        )
+        return payload
+
+    @staticmethod
+    def _normalize_artist_name(value):
+        return " ".join(str(value or "").strip().lower().split())
+
+    def _get_cached_artist_search_results(self, artist_name):
+        normalized_artist_name = self._normalize_artist_name(artist_name)
+        if not normalized_artist_name:
+            return []
+        return self._with_subcache_sync(
+            "artist_search",
+            {"artist_name": normalized_artist_name},
+            lambda: self.clients.call_ytmusic(
+                "search",
+                str(artist_name).strip(),
+                filter="artists",
+                timeout=self.settings.upstream_timeout_sec,
+            ),
+        )
+
     def _fetch_recommendation_seed(self, song_id):
         return self._get_cached_watch_playlist(song_id)
 
@@ -345,6 +577,154 @@ class HotEndpointsService:
             cache_key,
             self.settings.cache_ttl_recommendations_sec,
             self.settings.cache_stale_recommendations_sec,
+            fetch,
+        )
+
+    @staticmethod
+    def _extract_primary_artist_name(track):
+        artists = track.get("artists", [])
+        if not isinstance(artists, list) or not artists:
+            return None
+        first_artist = artists[0]
+        if isinstance(first_artist, dict):
+            return first_artist.get("name")
+        if isinstance(first_artist, str):
+            return first_artist
+        return None
+
+    def artist_songs(self, artist_id):
+        normalized_artist_id = str(artist_id).strip()
+        cache_key = f"artist_songs:{stable_sha256({'artist_id': normalized_artist_id})}"
+
+        def fetch():
+            artist_details = self._get_cached_artist(normalized_artist_id)
+
+            release_album_ids = []
+            seen_album_ids = set()
+            for section in artist_details.get("sections", []):
+                section_title = str(section.get("title", "")).lower()
+                if not any(
+                    keyword in section_title
+                    for keyword in ["album", "single", "ep", "compilation"]
+                ):
+                    continue
+                for item in section.get("items", []):
+                    album_id = item.get("browseId")
+                    if not album_id or album_id in seen_album_ids:
+                        continue
+                    seen_album_ids.add(album_id)
+                    release_album_ids.append(album_id)
+
+            album_details_by_id = {}
+            if release_album_ids:
+                worker_count = min(
+                    max(1, self.settings.max_workers_artist_songs),
+                    len(release_album_ids),
+                )
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    future_to_album = {
+                        executor.submit(self._get_cached_album, album_id): album_id
+                        for album_id in release_album_ids
+                    }
+                    for future in as_completed(future_to_album):
+                        album_id = future_to_album[future]
+                        try:
+                            album_details_by_id[album_id] = future.result(
+                                timeout=self.settings.upstream_timeout_sec * 2 + 1.0
+                            )
+                        except Exception as exc:
+                            self.logger.error("Error processing album %s: %s", album_id, exc)
+
+            all_songs = []
+            for album_id in release_album_ids:
+                album_details = album_details_by_id.get(album_id)
+                if not isinstance(album_details, dict):
+                    continue
+                for track in album_details.get("tracks", []):
+                    if not isinstance(track, dict):
+                        continue
+                    all_songs.append(
+                        {
+                            "title": track.get("title"),
+                            "videoId": track.get("videoId"),
+                            "artist": self._extract_primary_artist_name(track),
+                            "album": album_details.get("title"),
+                            "duration": track.get("duration"),
+                            "year": album_details.get("year"),
+                        }
+                    )
+
+            seen_song_ids = set()
+            unique_songs = []
+            for song in all_songs:
+                identifier = song.get("videoId") or song.get("title")
+                if identifier and identifier not in seen_song_ids:
+                    seen_song_ids.add(identifier)
+                    unique_songs.append(song)
+
+            return unique_songs
+
+        return self._with_cache_sync(
+            cache_key,
+            self.settings.cache_ttl_artist_songs_sec,
+            self.settings.cache_stale_artist_songs_sec,
+            fetch,
+        )
+
+    def _fetch_single_song(self, song_id, transform_fn):
+        try:
+            song_data = self._get_cached_song(song_id)
+        except Exception as exc:
+            self.logger.error("Error fetching data for song ID %s: %s", song_id, exc)
+            return {"error": f"Failed to fetch data for song ID {song_id}"}
+
+        try:
+            transformed_data = transform_fn(song_data)
+        except Exception as exc:
+            self.logger.error("Error transforming data for song ID %s: %s", song_id, exc)
+            return {"error": f"Failed to transform data for song ID {song_id}"}
+
+        if transformed_data:
+            return transformed_data
+        return {"error": f"Failed to transform data for song ID {song_id}"}
+
+    def songs(self, song_ids, transform_fn):
+        normalized_song_ids = [str(song_id) for song_id in song_ids]
+        cache_key = f"songs_batch:{stable_sha256({'song_ids': normalized_song_ids})}"
+
+        def fetch():
+            if not song_ids:
+                return []
+
+            ordered_results = [None] * len(song_ids)
+            worker_count = min(max(1, self.settings.max_workers_songs), len(song_ids))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(self._fetch_single_song, song_id, transform_fn): idx
+                    for idx, song_id in enumerate(song_ids)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        ordered_results[idx] = future.result(
+                            timeout=self.settings.upstream_timeout_sec * 2 + 1.0
+                        )
+                    except Exception as exc:
+                        song_id = song_ids[idx]
+                        self.logger.error(
+                            "Unhandled song processing error for song ID %s: %s",
+                            song_id,
+                            exc,
+                        )
+                        ordered_results[idx] = {
+                            "error": f"Failed to fetch data for song ID {song_id}"
+                        }
+            return ordered_results
+
+        return self._with_cache_sync(
+            cache_key,
+            self.settings.cache_ttl_songs_sec,
+            self.settings.cache_stale_songs_sec,
             fetch,
         )
 
@@ -529,11 +909,8 @@ class HotEndpointsService:
         async with artist_sem:
             try:
                 search_results = await asyncio.to_thread(
-                    self.clients.call_ytmusic,
-                    "search",
+                    self._get_cached_artist_search_results,
                     artist_name,
-                    filter="artists",
-                    timeout=self.settings.upstream_timeout_sec,
                 )
                 if search_results:
                     artist_data = search_results[0]
