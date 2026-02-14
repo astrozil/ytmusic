@@ -1,9 +1,9 @@
-flask[async]        # If using Flask
-ytmusicapi     # For interacting with YouTube Music
-beautifulsoup4    # For lyrics
+flask[async]
+ytmusicapi
+beautifulsoup4
 flask_caching
 flask_limiter
 billboard.py
 waitress
-datetime
 redis
+pytest
