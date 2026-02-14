@@ -378,12 +378,51 @@ def get_artist_songs(artist_id):
 
 
 def fetch_song(video):
+    if not isinstance(video, dict):
+        return video
+
     title = video.get("title", "")
     artists = video.get("artists", [])
-    artist_name = artists[0].get("name") if artists else ""
+
+    artist_name = ""
+    if isinstance(artists, list) and artists:
+        first_artist = artists[0]
+        if isinstance(first_artist, dict):
+            artist_name = first_artist.get("name", "")
+        elif isinstance(first_artist, str):
+            artist_name = first_artist
+    elif isinstance(artists, str):
+        artist_name = artists
+
     query = f"{title} {artist_name}".strip()
-    search_results = ytmusic.search(query, filter="songs")
-    return search_results[0] if search_results else video
+    if not query:
+        return video
+
+    try:
+        search_results = ytmusic.search(query, filter="songs")
+    except Exception as e:
+        logger.warning(f"Failed to enrich trending song '{query}': {e}")
+        return video
+
+    return search_results[0] if isinstance(search_results, list) and search_results else video
+
+def get_trending_video_items(charts, limit):
+    if isinstance(charts, dict):
+        raw_videos = charts.get("videos", [])
+        if isinstance(raw_videos, dict):
+            items = raw_videos.get("items", [])
+        elif isinstance(raw_videos, list):
+            items = raw_videos
+        else:
+            items = []
+    elif isinstance(charts, list):
+        items = charts
+    else:
+        items = []
+
+    # Keep only dict entries expected by fetch_song.
+    valid_items = [item for item in items if isinstance(item, dict)]
+    return valid_items[:limit]
 
 @app.route("/trending", methods=["GET"])
 def trending_songs():
@@ -404,7 +443,7 @@ def trending_songs():
 
     try:
         charts = ytmusic.get_charts(country=country)
-        trending_video_items = charts.get("videos", {}).get("items", [])[:limit]
+        trending_video_items = get_trending_video_items(charts, limit)
         
         # Use a thread pool to search for songs concurrently.
         with concurrent.futures.ThreadPoolExecutor() as executor:
