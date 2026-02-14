@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify, abort, has_request_context
 from ytmusicapi import YTMusic
 from flask_caching import Cache
 import billboard
@@ -8,26 +8,157 @@ import requests
 import logging
 import concurrent.futures
 import os
+import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 from waitress import serve
 from datetime import datetime,timedelta
 from redis import from_url as redis_from_url
+from redis.exceptions import RedisError
 
 
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 
-app.config.update({
-    'CACHE_TYPE': 'RedisCache',
-    'CACHE_REDIS_URL': redis_url,
-    'CACHE_DEFAULT_TIMEOUT': 86400,
-    'CACHE_THRESHOLD': 5000,
-    'CACHE_KEY_PREFIX': 'ytmusic_api_'
-})
-cache = Cache(app)
+def parse_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+def get_cache_config(cache_type, redis_url=None):
+    cache_config = {
+        'CACHE_TYPE': cache_type,
+        'CACHE_DEFAULT_TIMEOUT': 86400,
+        'CACHE_THRESHOLD': 5000,
+        'CACHE_KEY_PREFIX': 'ytmusic_api_'
+    }
+    if cache_type == 'RedisCache' and redis_url:
+        cache_config['CACHE_REDIS_URL'] = redis_url
+    return cache_config
+
+def initialize_cache(flask_app):
+    cache_backend = os.getenv('CACHE_BACKEND', 'redis').strip().lower()
+    cache_fail_open = parse_bool(os.getenv('CACHE_FAIL_OPEN', 'true'), default=True)
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+    timeout_raw = os.getenv('CACHE_REDIS_CONNECT_TIMEOUT', '2')
+
+    try:
+        redis_connect_timeout = float(timeout_raw)
+    except ValueError:
+        logger.warning(
+            "Invalid CACHE_REDIS_CONNECT_TIMEOUT '%s'. Falling back to 2 seconds.",
+            timeout_raw
+        )
+        redis_connect_timeout = 2.0
+
+    if cache_backend not in {'redis', 'simple'}:
+        logger.warning(
+            "Invalid CACHE_BACKEND '%s'. Falling back to 'redis'.",
+            cache_backend
+        )
+        cache_backend = 'redis'
+
+    cache_status = {
+        "backend": cache_backend,
+        "mode": "fail_open" if cache_fail_open else "fail_closed",
+        "healthy": True,
+        "last_error": None
+    }
+
+    if cache_backend == 'simple':
+        flask_app.config.update(get_cache_config('SimpleCache'))
+        logger.info(
+            "Cache initialized with backend=%s mode=%s",
+            cache_status["backend"],
+            cache_status["mode"]
+        )
+        return Cache(flask_app), cache_status, cache_fail_open
+
+    try:
+        redis_client = redis_from_url(
+            redis_url,
+            socket_connect_timeout=redis_connect_timeout,
+            socket_timeout=redis_connect_timeout
+        )
+        redis_client.ping()
+        flask_app.config.update(get_cache_config('RedisCache', redis_url=redis_url))
+        cache_instance = Cache(flask_app)
+        logger.info(
+            "Cache initialized with backend=%s mode=%s",
+            cache_status["backend"],
+            cache_status["mode"]
+        )
+        return cache_instance, cache_status, cache_fail_open
+    except (RedisError, OSError, socket.gaierror, ValueError) as exc:
+        cache_status["healthy"] = False
+        cache_status["last_error"] = f"Redis startup check failed: {exc}"
+
+        if not cache_fail_open:
+            raise RuntimeError("Redis startup check failed and CACHE_FAIL_OPEN=false") from exc
+
+        logger.warning(
+            "Redis startup check failed (%s). Falling back to SimpleCache.",
+            exc
+        )
+        cache_status["backend"] = "simple"
+        cache_status["healthy"] = True
+        flask_app.config.update(get_cache_config('SimpleCache'))
+        cache_instance = Cache(flask_app)
+        logger.info(
+            "Cache initialized with backend=%s mode=%s",
+            cache_status["backend"],
+            cache_status["mode"]
+        )
+        return cache_instance, cache_status, cache_fail_open
+
+cache, cache_status, cache_fail_open = initialize_cache(app)
+
+def record_cache_success():
+    cache_status["healthy"] = True
+    cache_status["last_error"] = None
+
+def record_cache_failure(operation, key, exc):
+    cache_status["healthy"] = False
+    endpoint = request.path if has_request_context() else "unknown"
+    cache_status["last_error"] = f"{operation} failed for key '{key}' on '{endpoint}': {exc}"
+    logger.warning("Cache %s failed for key '%s' on '%s': %s", operation, key, endpoint, exc)
+
+def cache_get_safe(key):
+    try:
+        value = cache.get(key)
+        record_cache_success()
+        return value
+    except (RedisError, OSError, socket.gaierror, ConnectionError) as exc:
+        record_cache_failure("get", key, exc)
+        if not cache_fail_open:
+            raise
+        return None
+    except Exception as exc:
+        record_cache_failure("get", key, exc)
+        if not cache_fail_open:
+            raise
+        return None
+
+def cache_set_safe(key, value, timeout=None):
+    try:
+        result = cache.set(key, value, timeout=timeout)
+        record_cache_success()
+        return result
+    except (RedisError, OSError, socket.gaierror, ConnectionError) as exc:
+        record_cache_failure("set", key, exc)
+        if not cache_fail_open:
+            raise
+        return False
+    except Exception as exc:
+        record_cache_failure("set", key, exc)
+        if not cache_fail_open:
+            raise
+        return False
+
 original_get = requests.get
 
 def make_daily_cache_key():
@@ -70,9 +201,6 @@ def patched_get(url, *args, **kwargs):
 
 # Patch requests.get globally
 requests.get = patched_get
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 ytmusic = YTMusic("browser.json")
 
@@ -263,7 +391,7 @@ def trending_songs():
     cache_key = make_trending_cache_key()
     
     # Check cache first
-    cached_data = cache.get(cache_key)
+    cached_data = cache_get_safe(cache_key)
     if cached_data:
         logger.info(f"Returning cached trending data for key: {cache_key}")
         return jsonify(cached_data)
@@ -282,7 +410,7 @@ def trending_songs():
         with concurrent.futures.ThreadPoolExecutor() as executor:
             trending_songs = list(executor.map(fetch_song, trending_video_items))
          # Cache until midnight for true daily refresh
-        cache.set(cache_key, trending_songs, timeout=get_seconds_until_midnight())
+        cache_set_safe(cache_key, trending_songs, timeout=get_seconds_until_midnight())
         logger.info(f"Cached trending data for key: {cache_key}")
         return jsonify(trending_songs)
     except Exception as e:
@@ -412,7 +540,7 @@ def get_seconds_until_next_tuesday():
 @app.route("/billboard", methods=["GET"])
 async def billboard_songs():
     cache_key = get_billboard_cache_key()  # Use date-based cache key
-    cached_data = cache.get(cache_key)
+    cached_data = cache_get_safe(cache_key)
     
     if cached_data:
         logger.info(f"Returning cached Billboard data for key: {cache_key}")
@@ -436,7 +564,7 @@ async def billboard_songs():
             }
         }
         
-        cache.set(cache_key, response_data, timeout=get_seconds_until_next_tuesday())
+        cache_set_safe(cache_key, response_data, timeout=get_seconds_until_next_tuesday())
         logger.info(f"Cached Billboard data for key: {cache_key}")
         
         return jsonify(response_data)
@@ -483,7 +611,7 @@ def mix_songs():
     cache_key = make_daily_cache_key()
     
     # Check cache first
-    cached_data = cache.get(cache_key)
+    cached_data = cache_get_safe(cache_key)
     if cached_data:
         logger.info(f"Returning cached mix data for key: {cache_key}")
         return jsonify(cached_data)
@@ -676,7 +804,7 @@ def mix_songs():
     logger.info(f"Artist distribution in mix: {dict(artist_count)}")
     
     # Cache the result
-    cache.set(cache_key, result, timeout=get_seconds_until_midnight())
+    cache_set_safe(cache_key, result, timeout=get_seconds_until_midnight())
     logger.info(f"Cached mix data for key: {cache_key}")
     
     return jsonify(result)
@@ -772,7 +900,7 @@ def get_recommendations():
     cache_key = make_recommendations_cache_key(song_ids)  
     
     # Check cache first
-    cached_data = cache.get(cache_key)
+    cached_data = cache_get_safe(cache_key)
     if cached_data:
         logger.info(f"Returning cached recommendations for key: {cache_key}")
         return jsonify(cached_data)
@@ -864,7 +992,7 @@ def get_recommendations():
     final_result = result_tracks[:50]
     
     # Cache until midnight for true daily refresh
-    cache.set(cache_key, final_result, timeout=get_seconds_until_midnight())
+    cache_set_safe(cache_key, final_result, timeout=get_seconds_until_midnight())
     logger.info(f"Cached recommendations for key: {cache_key}")
     
     return jsonify(final_result)
@@ -998,7 +1126,15 @@ def get_multiple_artists():
 # Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy"}), 200
+    return jsonify({
+        "status": "healthy",
+        "cache": {
+            "backend": cache_status["backend"],
+            "mode": cache_status["mode"],
+            "healthy": cache_status["healthy"],
+            "last_error": cache_status["last_error"]
+        }
+    }), 200
 
 # Error handlers
 @app.errorhandler(404)
