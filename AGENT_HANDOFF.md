@@ -165,3 +165,64 @@ python app.py
 # Load smoke
 python scripts/load_smoke.py --base-url http://localhost:5000 --artist-ids <ids> --song-ids <ids>
 ```
+
+## 5) Artwork Quality Upgrade (544 Profile, Schema-Compatible)
+
+### Goal
+Improve artwork quality returned by API responses (songs, artists, albums, related, mix, trending, recommendations, etc.) without breaking existing response contracts.
+
+### What Was Added
+- New centralized thumbnail utility module:
+  - `services/thumbnail_quality.py`
+  - Capabilities:
+    - rewrite Google image size segments (`wX-hY`) to higher resolution targets,
+    - normalize/dedupe thumbnail arrays,
+    - append higher-quality variant (target max dimension 544) when source is small,
+    - generate fallback thumbnails from `videoId` when no thumbnails are provided,
+    - recursively enhance nested payloads while preserving schema.
+
+### Integration Points
+- `app.py`:
+  - `transform_song_data(...)` now normalizes thumbnails through shared helper.
+  - Route payload enhancement applied before `jsonify(...)` on:
+    - `/search`
+    - `/song/<song_id>`
+    - `/related/<song_id>`
+    - `/artist/<artist_id>`
+    - `/artist/<artist_id>/songs`
+    - `/album/<album_id>`
+    - `/mix`
+    - `/trending`
+    - `/billboard`
+    - `/songs`
+    - `/recommendations`
+    - `/artists` (including `thumbnail` object enhancement path)
+- `services/hot_endpoints.py`:
+  - `format_thumbnails(...)` now routes through shared normalization helper.
+
+### Compatibility Notes
+- Endpoint schemas and field names were preserved.
+- No cache-key changes were introduced.
+- Behavioral-only improvements:
+  - better URLs inside existing thumbnail fields,
+  - optional additional high-quality thumbnail entry in existing `thumbnails` arrays,
+  - fallback thumbnail population when upstream thumbnails are empty and `videoId` is known.
+
+### Tests Added
+- New test module:
+  - `tests/test_thumbnail_quality.py`
+- Coverage includes:
+  - URL rewrite/upscale behavior,
+  - aspect-ratio-preserving upscale behavior,
+  - empty-thumbnail fallback generation from `videoId`,
+  - recursive payload enhancement behavior.
+
+### Validation
+- Command:
+  - `.\.venv\Scripts\python -m pytest -q`
+- Result after this workstream:
+  - `34 passed`
+
+### App Repo Counterpart
+- Companion Flutter-side artwork quality updates are documented in:
+  - `D:\flutter projects\jazz\AGENT_HANDOFF.md`

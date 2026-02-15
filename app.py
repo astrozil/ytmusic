@@ -26,6 +26,11 @@ from settings import Settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+ARTIST_SPLIT_PATTERN = re.compile(
+    r"\s*(?:,|;|/|&|\||\bfeat\.?\b|\bft\.?\b|\bfeaturing\b)\s*",
+    re.IGNORECASE,
+)
+
 
 def format_genius_url(artist, song_title):
     artist = re.sub(r"[^\w\s-]", "", artist).strip().replace(" ", "-")
@@ -76,6 +81,150 @@ def lyrics_negative_backoff_ttl(settings_obj, failure_count):
     )
     bounded_ttl = min(float(settings_obj.cache_ttl_lyrics_negative_max_sec), raw_ttl)
     return max(1, int(bounded_ttl))
+
+
+def clean_lyrics_text(value):
+    if not isinstance(value, str):
+        return None
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return normalized or None
+
+
+def lrc_to_plain_text(synced_lyrics):
+    if not isinstance(synced_lyrics, str):
+        return None
+    plain_lines = []
+    for raw_line in synced_lyrics.splitlines():
+        text_only = re.sub(r"\[[^\]]+\]", "", raw_line).strip()
+        if text_only:
+            plain_lines.append(text_only)
+    return clean_lyrics_text("\n".join(plain_lines))
+
+
+def extract_primary_artist(artist_name):
+    source_value = str(artist_name or "").strip()
+    if not source_value:
+        return ""
+    split_values = ARTIST_SPLIT_PATTERN.split(source_value, maxsplit=1)
+    if not split_values:
+        return source_value
+    return split_values[0].strip() or source_value
+
+
+def lyrics_artist_candidates(artist_name):
+    normalized_candidates = []
+    seen = set()
+    for raw_candidate in [artist_name, extract_primary_artist(artist_name)]:
+        candidate = " ".join(str(raw_candidate or "").strip().split())
+        if not candidate:
+            continue
+        dedupe_token = candidate.lower()
+        if dedupe_token in seen:
+            continue
+        seen.add(dedupe_token)
+        normalized_candidates.append(candidate)
+    return normalized_candidates
+
+
+def fetch_lrclib_lyrics(clients, song_title, artist_name):
+    try:
+        response = clients.http_get(
+            "https://lrclib.net/api/get",
+            timeout=10,
+            params={"track_name": song_title, "artist_name": artist_name},
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json() if hasattr(response, "json") else {}
+        if not isinstance(payload, dict):
+            return None
+        synced_lyrics = clean_lyrics_text(payload.get("syncedLyrics"))
+        plain_lyrics = clean_lyrics_text(payload.get("plainLyrics") or payload.get("lyrics"))
+        if not plain_lyrics and synced_lyrics:
+            plain_lyrics = lrc_to_plain_text(synced_lyrics)
+        if not plain_lyrics:
+            return None
+        return {
+            "lyrics": plain_lyrics,
+            "syncedLyrics": synced_lyrics,
+            "isSynced": bool(synced_lyrics),
+        }
+    except Exception as exc:
+        logger.error(
+            "lrclib lyrics lookup failed for '%s' by '%s': %s",
+            song_title,
+            artist_name,
+            exc,
+        )
+        return None
+
+
+def fetch_lyrics_ovh(clients, song_title, artist_name):
+    fallback_url = f"https://api.lyrics.ovh/v1/{artist_name}/{song_title}"
+    try:
+        fallback_response = clients.http_get(fallback_url, timeout=10)
+        if fallback_response.status_code != 200:
+            return None
+        fallback_payload = fallback_response.json() if hasattr(fallback_response, "json") else {}
+        if not isinstance(fallback_payload, dict):
+            return None
+        return clean_lyrics_text(fallback_payload.get("lyrics"))
+    except Exception as exc:
+        logger.error("Fallback lyrics error: %s", exc)
+        return None
+
+
+def resolve_lyrics_payload(clients, song_title, artist_name):
+    candidates = lyrics_artist_candidates(artist_name)
+    if not candidates:
+        return None
+
+    for normalized_artist in candidates:
+        lrclib_payload = fetch_lrclib_lyrics(clients, song_title, normalized_artist)
+        if lrclib_payload:
+            return {
+                "song_title": song_title,
+                "artist": artist_name,
+                "lyrics": lrclib_payload["lyrics"],
+                "syncedLyrics": lrclib_payload["syncedLyrics"],
+                "isSynced": lrclib_payload["isSynced"],
+                "source": "lrclib",
+                "normalizedArtist": normalized_artist,
+            }
+
+    for normalized_artist in candidates:
+        lyrics_url = format_genius_url(normalized_artist, song_title)
+        scraped_lyrics = clean_lyrics_text(scrape_lyrics(clients, lyrics_url))
+        if scraped_lyrics:
+            return {
+                "song_title": song_title,
+                "artist": artist_name,
+                "lyrics": scraped_lyrics,
+                "syncedLyrics": None,
+                "isSynced": False,
+                "source": "genius",
+                "normalizedArtist": normalized_artist,
+            }
+
+    for normalized_artist in candidates:
+        fallback_lyrics = fetch_lyrics_ovh(clients, song_title, normalized_artist)
+        if fallback_lyrics:
+            logger.info(
+                "Fallback lyrics found for %s by %s",
+                song_title,
+                normalized_artist,
+            )
+            return {
+                "song_title": song_title,
+                "artist": artist_name,
+                "lyrics": fallback_lyrics,
+                "syncedLyrics": None,
+                "isSynced": False,
+                "source": "lyrics_ovh",
+                "normalizedArtist": normalized_artist,
+            }
+
+    return None
 
 
 def transform_song_data(song_data):
@@ -247,20 +396,9 @@ def create_app(
                 )
                 abort(404, description="Lyrics not found on Genius or fallback service")
 
-        lyrics_url = format_genius_url(artist_name, song_title)
-        lyrics = scrape_lyrics(get_clients(), lyrics_url)
+        payload = resolve_lyrics_payload(get_clients(), song_title, artist_name)
 
-        if not lyrics:
-            fallback_url = f"https://api.lyrics.ovh/v1/{artist_name}/{song_title}"
-            try:
-                fallback_response = get_clients().http_get(fallback_url, timeout=10)
-                if fallback_response.status_code == 200:
-                    lyrics = fallback_response.json().get("lyrics")
-                    logger.info("Fallback lyrics found for %s by %s", song_title, artist_name)
-            except Exception as exc:
-                logger.error("Fallback lyrics error: %s", exc)
-
-        if not lyrics:
+        if not payload or not payload.get("lyrics"):
             previous_failures = 0
             if isinstance(negative_state, dict):
                 try:
@@ -280,7 +418,6 @@ def create_app(
             logger.warning("Lyrics not found for %s by %s", song_title, artist_name)
             abort(404, description="Lyrics not found on Genius or fallback service")
 
-        payload = {"song_title": song_title, "artist": artist_name, "lyrics": lyrics}
         cache_layer.set_envelope(
             lyrics_cache_key,
             payload,
