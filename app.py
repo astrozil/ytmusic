@@ -15,6 +15,11 @@ from clients import UpstreamClients
 from errors import register_error_handlers, register_request_hooks
 from services.hot_endpoints import HotEndpointsService
 from services.prewarm import PrewarmManager
+from services.thumbnail_quality import (
+    enhance_payload_thumbnails,
+    normalize_thumbnails,
+    select_best_thumbnail,
+)
 from settings import Settings
 
 
@@ -83,15 +88,12 @@ def transform_song_data(song_data):
         artist_name = artists if isinstance(artists, str) else ", ".join(artists)
         artist_id = video_details.get("channelId", "")
 
+        video_id = video_details.get("videoId", "")
         thumbnails = video_details.get("thumbnail", {}).get("thumbnails", [])
-        formatted_thumbnails = [
-            {
-                "url": thumb.get("url"),
-                "width": thumb.get("width"),
-                "height": thumb.get("height"),
-            }
-            for thumb in thumbnails
-        ]
+        formatted_thumbnails = normalize_thumbnails(
+            thumbnails,
+            video_id=video_id,
+        )
 
         feedback_tokens = music_analytics.get("feedbackTokens", {})
         add_token = feedback_tokens.get("add", "")
@@ -109,7 +111,7 @@ def transform_song_data(song_data):
             "resultType": "song",
             "thumbnails": formatted_thumbnails,
             "title": video_details.get("title", ""),
-            "videoId": video_details.get("videoId", ""),
+            "videoId": video_id,
             "videoType": "LIVE"
             if video_details.get("isLive", False)
             else "MUSIC_VIDEO_TYPE_ATV",
@@ -194,7 +196,7 @@ def create_app(
             abort(400, description="Query parameter is required and must be a string")
         try:
             results = get_clients().call_ytmusic("search", query, filter=filter_value)
-            return jsonify(results)
+            return jsonify(enhance_payload_thumbnails(results))
         except Exception as exc:
             logger.error("Error searching YTMusic: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -205,7 +207,7 @@ def create_app(
             abort(400, description="Song ID is required and must be a string")
         try:
             details = get_clients().call_ytmusic("get_song", song_id)
-            return jsonify(details)
+            return jsonify(enhance_payload_thumbnails(details))
         except Exception as exc:
             logger.error("Error fetching song details: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -298,7 +300,9 @@ def create_app(
             abort(400, description="Song ID is required and must be a string")
         try:
             watch_playlist = get_clients().call_ytmusic("get_watch_playlist", song_id)
-            return jsonify(watch_playlist.get("tracks", []))
+            return jsonify(
+                enhance_payload_thumbnails(watch_playlist.get("tracks", []))
+            )
         except Exception as exc:
             logger.error("Error fetching related songs: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -309,7 +313,7 @@ def create_app(
             abort(400, description="Artist ID is required and must be a string")
         try:
             details = get_clients().call_ytmusic("get_artist", artist_id)
-            return jsonify(details)
+            return jsonify(enhance_payload_thumbnails(details))
         except Exception as exc:
             logger.error("Error fetching artist details: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -320,7 +324,7 @@ def create_app(
             abort(400, description="Artist ID is required and must be a string")
         try:
             payload, _, _ = get_hot_service().artist_songs(artist_id)
-            return jsonify(payload)
+            return jsonify(enhance_payload_thumbnails(payload))
         except Exception as exc:
             logger.error("Error fetching artist songs: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -334,7 +338,7 @@ def create_app(
             payload, cache_state, stale_fallback = get_hot_service().trending(
                 country, limit_value
             )
-            response = jsonify(payload)
+            response = jsonify(enhance_payload_thumbnails(payload))
             response.headers.update(
                 cache_layer.headers_for_state(cache_state, stale_fallback=stale_fallback)
             )
@@ -348,7 +352,7 @@ def create_app(
     async def billboard_songs():
         try:
             payload, cache_state, stale_fallback = await get_hot_service().billboard()
-            response = jsonify(payload)
+            response = jsonify(enhance_payload_thumbnails(payload))
             response.headers.update(
                 cache_layer.headers_for_state(cache_state, stale_fallback=stale_fallback)
             )
@@ -363,7 +367,7 @@ def create_app(
             abort(400, description="Album ID is required and must be a string")
         try:
             details = get_clients().call_ytmusic("get_album", album_id)
-            return jsonify(details)
+            return jsonify(enhance_payload_thumbnails(details))
         except Exception as exc:
             logger.error("Error fetching album details: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -380,7 +384,7 @@ def create_app(
             payload, cache_state, stale_fallback = get_hot_service().mix(
                 artist_ids, limit_value
             )
-            response = jsonify(payload)
+            response = jsonify(enhance_payload_thumbnails(payload))
             response.headers.update(
                 cache_layer.headers_for_state(cache_state, stale_fallback=stale_fallback)
             )
@@ -399,7 +403,7 @@ def create_app(
             abort(400, description="A list of song IDs is required.")
         try:
             payload, _, _ = get_hot_service().songs(song_ids, transform_song_data)
-            return jsonify(payload)
+            return jsonify(enhance_payload_thumbnails(payload))
         except Exception as exc:
             logger.error("Error fetching songs: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -417,7 +421,7 @@ def create_app(
             payload, cache_state, stale_fallback = get_hot_service().recommendations(
                 song_ids
             )
-            response = jsonify(payload)
+            response = jsonify(enhance_payload_thumbnails(payload))
             response.headers.update(
                 cache_layer.headers_for_state(cache_state, stale_fallback=stale_fallback)
             )
@@ -458,21 +462,9 @@ def create_app(
         def fetch_artist_info(artist_id):
             try:
                 artist_details = get_clients().call_ytmusic("get_artist", artist_id)
-                thumbnails = artist_details.get("thumbnails", [])
-                high_quality_thumbnail = None
-                if thumbnails:
-                    sorted_thumbnails = sorted(
-                        thumbnails,
-                        key=lambda thumb: (
-                            thumb.get("width", 0) * thumb.get("height", 0)
-                        ),
-                        reverse=True,
-                    )
-                    high_quality_thumbnail = {
-                        "url": sorted_thumbnails[0].get("url"),
-                        "width": sorted_thumbnails[0].get("width"),
-                        "height": sorted_thumbnails[0].get("height"),
-                    }
+                high_quality_thumbnail = select_best_thumbnail(
+                    artist_details.get("thumbnails", []),
+                )
                 return {
                     "browseId": artist_id,
                     "name": artist_details.get("name"),
@@ -530,7 +522,7 @@ def create_app(
                 {"browseId": artist["browseId"], "error": artist["error"]}
                 for artist in failed_artists
             ]
-        return jsonify(response_data)
+        return jsonify(enhance_payload_thumbnails(response_data))
 
     @app.route("/health", methods=["GET"])
     def health_check():

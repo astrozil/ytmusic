@@ -18,19 +18,11 @@ from cache_layer import (
     key_for_trending,
     stable_sha256,
 )
+from services.thumbnail_quality import normalize_thumbnails
 
 
-def format_thumbnails(thumbnails):
-    if not thumbnails:
-        return []
-    return [
-        {
-            "height": thumb.get("height"),
-            "width": thumb.get("width"),
-            "url": thumb.get("url"),
-        }
-        for thumb in thumbnails
-    ]
+def format_thumbnails(thumbnails, video_id=None):
+    return normalize_thumbnails(thumbnails, video_id=video_id)
 
 
 def parse_limit(value, default=50, minimum=1, maximum=50):
@@ -750,7 +742,10 @@ class HotEndpointsService:
                                 "artists": self._extract_artists(track),
                                 "album": None,
                                 "duration": track.get("duration"),
-                                "thumbnails": format_thumbnails(track.get("thumbnails")),
+                                "thumbnails": format_thumbnails(
+                                    track.get("thumbnails"),
+                                    video_id=track.get("videoId"),
+                                ),
                             }
                         )
                 except Exception as exc:
@@ -766,7 +761,10 @@ class HotEndpointsService:
                             "artists": self._extract_artists(song),
                             "album": song.get("album"),
                             "duration": song.get("duration"),
-                            "thumbnails": format_thumbnails(song.get("thumbnails")),
+                            "thumbnails": format_thumbnails(
+                                song.get("thumbnails"),
+                                video_id=song.get("videoId"),
+                            ),
                         }
                     )
 
@@ -803,7 +801,10 @@ class HotEndpointsService:
                                 "artists": artists,
                                 "album": album_info.get("title"),
                                 "duration": track.get("duration"),
-                                "thumbnails": format_thumbnails(raw_thumbnails),
+                                "thumbnails": format_thumbnails(
+                                    raw_thumbnails,
+                                    video_id=track.get("videoId"),
+                                ),
                             }
                         )
                 except Exception as exc:
