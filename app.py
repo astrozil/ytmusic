@@ -4,6 +4,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 
 from flask import Flask, abort, jsonify, request
 from flask_limiter import Limiter
@@ -160,7 +161,9 @@ def fetch_lrclib_lyrics(clients, song_title, artist_name):
 
 
 def fetch_lyrics_ovh(clients, song_title, artist_name):
-    fallback_url = f"https://api.lyrics.ovh/v1/{artist_name}/{song_title}"
+    encoded_artist = quote(str(artist_name or "").strip(), safe="")
+    encoded_title = quote(str(song_title or "").strip(), safe="")
+    fallback_url = f"https://api.lyrics.ovh/v1/{encoded_artist}/{encoded_title}"
     try:
         fallback_response = clients.http_get(fallback_url, timeout=10)
         if fallback_response.status_code != 200:

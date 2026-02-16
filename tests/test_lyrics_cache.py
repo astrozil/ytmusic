@@ -54,7 +54,7 @@ class LyricsRouteFakeClients:
                     },
                 )
             return LyricsFakeResponse(404, json_body={})
-        if self.mode in {"genius_success", "not_found"}:
+        if self.mode in {"genius_success", "lyrics_ovh_success", "not_found"}:
             return LyricsFakeResponse(404, json_body={})
         raise RuntimeError(f"unexpected mode={self.mode}")
 
@@ -121,6 +121,29 @@ def test_lyrics_plain_only_payload_is_supported(settings_factory):
     assert payload["syncedLyrics"] is None
     assert payload["isSynced"] is False
     assert payload["source"] == "lrclib"
+
+
+def test_lyrics_ovh_fallback_uses_encoded_path_segments(settings_factory):
+    from app import create_app
+
+    settings = settings_factory(ENABLE_RATE_LIMITS="false")
+    fake_clients = LyricsRouteFakeClients(mode="lyrics_ovh_success")
+    app = create_app(settings_obj=settings, clients_obj=fake_clients)
+    client = app.test_client()
+
+    response = client.get("/lyrics?title=Back%20In%20Black&artist=AC%2FDC")
+    assert response.status_code == 200
+
+    payload = response.get_json()
+    assert payload["lyrics"] == "fallback line-1"
+    assert payload["source"] == "lyrics_ovh"
+
+    fallback_calls = [
+        call for call in fake_clients.http_calls if "api.lyrics.ovh" in call["url"]
+    ]
+    assert fallback_calls
+    assert "AC%2FDC" in fallback_calls[0]["url"]
+    assert "Back%20In%20Black" in fallback_calls[0]["url"]
 
 
 def test_lyrics_negative_cache_skips_repeated_upstream_calls(settings_factory):

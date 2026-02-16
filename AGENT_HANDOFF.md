@@ -226,3 +226,100 @@ Improve artwork quality returned by API responses (songs, artists, albums, relat
 ### App Repo Counterpart
 - Companion Flutter-side artwork quality updates are documented in:
   - `D:\flutter projects\jazz\AGENT_HANDOFF.md`
+
+## 6) Lyrics Provider Chain Upgrade + `/lyrics` Contract Extension
+
+### Goal
+Improve `/lyrics` reliability and payload quality while preserving backward compatibility for existing clients.
+
+### What Was Added
+- Expanded `/lyrics` resolver to use a provider chain:
+  1. `lrclib` (`/api/get`) for synced + plain payloads
+  2. existing Genius scrape fallback
+  3. existing `lyrics.ovh` fallback
+- Added artist normalization candidate flow:
+  - exact artist input first
+  - primary artist fallback (split by comma/feat/ft/featuring separators)
+- Added plain-lyrics extraction from synced LRC when plain text is missing.
+
+### `/lyrics` Response Compatibility
+- Existing successful fields are preserved:
+  - `song_title`
+  - `artist`
+  - `lyrics`
+- Added optional extended fields:
+  - `syncedLyrics`
+  - `isSynced`
+  - `source` (`lrclib` | `genius` | `lyrics_ovh`)
+  - `normalizedArtist`
+
+### Cache Behavior
+- Positive lyrics caching remains envelope-based (`payload`, TTL + stale window).
+- Negative backoff cache semantics remain unchanged:
+  - exponential backoff retry windows
+  - repeated misses are short-circuited until retry threshold.
+- Extended lyrics payload is now what gets cached on successful responses.
+
+### Files Modified in This Workstream (API Repo)
+- `app.py`
+- `tests/test_lyrics_cache.py`
+- `AGENT_HANDOFF.md`
+
+### Tests Added/Updated
+- `tests/test_lyrics_cache.py` now covers:
+  1. successful cached response with extended fields (`syncedLyrics`, `isSynced`, etc.)
+  2. plain-only lyrics payload handling
+  3. negative-cache short-circuit behavior
+  4. negative-cache backoff TTL growth behavior
+  5. primary-artist normalization fallback behavior for multi-artist input
+
+### Validation
+- Command:
+  - `.\.venv\Scripts\python -m pytest -q`
+- Result after this workstream:
+  - `36 passed`
+
+### App Repo Counterpart
+- Companion Flutter-side lyrics state/parser/backend-integration updates are documented in:
+  - `D:\flutter projects\jazz\AGENT_HANDOFF.md`
+
+## 7) Lyrics Follow-up: Encoded `lyrics.ovh` Fallback Paths
+
+### Goal
+Fix fallback reliability for `/lyrics` when artist/title values include URL-sensitive characters, while preserving existing `/lyrics` response contract and cache behavior.
+
+### Problem
+`fetch_lyrics_ovh(...)` built fallback URLs with raw path interpolation:
+- `https://api.lyrics.ovh/v1/{artist}/{title}`
+
+For values like `AC/DC`, unencoded path separators could alter endpoint path semantics and cause fallback misses.
+
+### What Was Added
+- Updated fallback URL construction in `app.py`:
+  - encode `artist_name` and `song_title` with `quote(..., safe="")`
+  - use encoded values for path segment assembly
+- Added regression test coverage in `tests/test_lyrics_cache.py`:
+  - new `lyrics_ovh_success` mode pass-through in fake client chain
+  - new test validates:
+    - `/lyrics` success response with `source == "lyrics_ovh"` for encoded-input scenario
+    - outbound fallback URL contains encoded segments (`AC%2FDC`, `Back%20In%20Black`)
+
+### Compatibility Notes
+- `/lyrics` response schema is unchanged.
+- Existing cache semantics (positive cache and negative backoff cache) are unchanged.
+- This is a behavior fix only for fallback path construction.
+
+### Files Modified in This Workstream (API Repo)
+- `app.py`
+- `tests/test_lyrics_cache.py`
+- `AGENT_HANDOFF.md`
+
+### Validation
+- Command:
+  - `.\.venv\Scripts\python -m pytest -q tests/test_lyrics_cache.py`
+- Result after this follow-up:
+  - `6 passed`
+
+### App Repo Counterpart
+- Companion Flutter-side synced-lyrics index guard fix is documented in:
+  - `D:\flutter projects\jazz\AGENT_HANDOFF.md`
