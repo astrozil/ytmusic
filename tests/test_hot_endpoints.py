@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
-from cache_layer import CacheLayer, key_for_billboard
+from cache_layer import CacheLayer, key_for_billboard, key_for_trending_country
 from services.hot_endpoints import HotEndpointsService
 
 
@@ -240,7 +240,6 @@ def test_trending_expands_chart_playlists_and_prefers_trending(settings_factory,
 
 def test_trending_playlist_failure_preserves_stale_tracks(settings_factory):
     from flask import Flask
-    from cache_layer import key_for_trending
 
     class FailingPlaylistClients(ServiceFakeClients):
         def call_ytmusic(self, method_name, *args, **kwargs):
@@ -254,9 +253,13 @@ def test_trending_playlist_failure_preserves_stale_tracks(settings_factory):
     settings = settings_factory()
     cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
     service = HotEndpointsService(FailingPlaylistClients(), cache_layer, settings, logger=flask_app.logger)
-    stale_tracks = [{"videoId": "cached", "title": "Cached song"}]
+    stale_tracks = [{
+        "videoId": "cached", "title": "Cached song",
+        "artists": [{"id": "a1", "name": "Artist"}], "duration": "3:00",
+        "thumbnails": [{"url": "https://example.com/cover.jpg"}],
+    }]
     now = time.time()
-    cache_layer.cache_set_safe(key_for_trending("US", 1), {
+    cache_layer.cache_set_safe(key_for_trending_country("US"), {
         "payload": stale_tracks, "fetched_at": now - 120,
         "fresh_until": now - 60, "stale_until": now + 120,
     }, timeout=120)
@@ -265,6 +268,163 @@ def test_trending_playlist_failure_preserves_stale_tracks(settings_factory):
     assert payload == stale_tracks
     assert state == "stale"
     assert stale_flag is True
+
+
+class TrendingMetadataClients(ServiceFakeClients):
+    def __init__(self, complete=True, fail_search=False):
+        super().__init__(sleep_get_charts=0.05)
+        self.complete = complete
+        self.fail_search = fail_search
+
+    @staticmethod
+    def track(index):
+        return {
+            "videoId": f"chart-{index}", "title": f"Song {index}",
+            "artists": [{"id": "artist-a", "name": "Artist A"}],
+            "album": {"id": "album-a", "name": "Album A"}, "duration": "3:00",
+            "thumbnails": [{"url": "https://example.com/cover.jpg", "width": 544, "height": 544}],
+            "isExplicit": False, "rank": index + 1,
+        }
+
+    def call_ytmusic(self, method_name, *args, **kwargs):
+        if method_name == "get_charts":
+            with self.lock:
+                self.method_counts[method_name] += 1
+            time.sleep(self.sleep_get_charts)
+            tracks = [self.track(index) for index in range(60)]
+            if not self.complete:
+                for track in tracks:
+                    track.pop("duration")
+            return {"videos": {"items": tracks}}
+        if method_name == "search":
+            with self.lock:
+                self.method_counts[method_name] += 1
+            if self.fail_search:
+                raise RuntimeError("temporary search failure")
+            return [{
+                "videoId": "different-version", "title": "Different title",
+                "artists": [{"id": "other", "name": "Other artist"}],
+                "duration": "3:01", "thumbnails": [],
+            }]
+        return super().call_ytmusic(method_name, *args, **kwargs)
+
+
+def trending_metadata_service(settings_factory, **client_options):
+    from flask import Flask
+
+    app = Flask(__name__)
+    clients = TrendingMetadataClients(**client_options)
+    layer = CacheLayer(app, settings_factory(), logger=app.logger)
+    return HotEndpointsService(clients, layer, layer.settings, logger=app.logger), clients
+
+
+def test_complete_trending_tracks_reuse_country_cache_without_searches(settings_factory):
+    service, clients = trending_metadata_service(settings_factory)
+    first, state, _ = service.trending(" us ", "20")
+    smaller, second_state, _ = service.trending("US", "10")
+    larger, _, _ = service.trending("US", "999")
+
+    assert first == [clients.track(index) for index in range(20)]
+    assert smaller == first[:10]
+    assert len(larger) == 50
+    assert state == "miss" and second_state == "hit"
+    assert clients.method_counts == {"get_charts": 1}
+    service.trending("CA", "1")
+    assert clients.method_counts["get_charts"] == 2
+
+
+def test_trending_enriches_only_requested_tracks_and_preserves_chart_metadata(settings_factory):
+    service, clients = trending_metadata_service(settings_factory, complete=False)
+    first, first_state, _ = service.trending("US", "2")
+    assert first_state == "miss"
+    assert clients.method_counts["search"] == 2
+    assert first[0] == {**clients.track(0), "duration": "3:01"}
+    _, cached_state, _ = service.trending("US", "1")
+    assert cached_state == "hit"
+    assert clients.method_counts["search"] == 2
+    _, larger_state, _ = service.trending("US", "3")
+    assert larger_state == "miss"
+    assert clients.method_counts == {"get_charts": 1, "search": 3}
+    # Shared enrichment survives a chart refresh or a different country.
+    service.trending("CA", "2")
+    assert clients.method_counts == {"get_charts": 2, "search": 3}
+    cached = service.cache_layer.get_envelope(key_for_trending_country("US"))
+    assert "duration" not in cached.payload[0]
+
+
+def test_trending_mixed_limit_concurrency_shares_chart_and_enrichment(settings_factory):
+    service, clients = trending_metadata_service(settings_factory, complete=False)
+    limits = [1, 3, 2, 3, 1, 2]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda limit: service.trending("US", str(limit)), limits))
+    assert clients.method_counts == {"get_charts": 1, "search": 3}
+    for limit, (payload, _, _) in zip(limits, results):
+        assert [track["videoId"] for track in payload] == [f"chart-{index}" for index in range(limit)]
+
+
+def test_failed_trending_enrichment_falls_back_without_caching_failure(settings_factory):
+    service, clients = trending_metadata_service(settings_factory, complete=False, fail_search=True)
+    fallback, _, _ = service.trending("US", "1")
+    assert fallback[0]["videoId"] == "chart-0"
+    assert "duration" not in fallback[0]
+    clients.fail_search = False
+    recovered, _, _ = service.trending("US", "1")
+    assert recovered[0]["duration"] == "3:01"
+    service.trending("US", "1")
+    assert clients.method_counts == {"get_charts": 1, "search": 2}
+
+
+def test_stale_trending_enrichment_marks_response_stale(settings_factory):
+    service, clients = trending_metadata_service(settings_factory, complete=False)
+    expected, _, _ = service.trending("US", "1")
+    key = service._subcache_key("trending_enrichment", {
+        "video_id": "chart-0", "query": "song 0 artist a",
+    })
+    envelope = service.cache_layer.get_envelope(key).envelope
+    envelope["fresh_until"] = time.time() - 1
+    service.cache_layer.cache_set_safe(key, envelope, timeout=120)
+    clients.fail_search = True
+
+    payload, state, stale = service.trending("US", "1")
+    assert payload == expected
+    assert state == "stale" and stale is True
+    assert service.cache_layer.headers_for_state(state, stale_fallback=stale)["X-Data-Stale"] == "1"
+
+
+@pytest.mark.parametrize("search_result", [[], [{}], [None]])
+def test_empty_trending_matches_remain_retryable(settings_factory, monkeypatch, search_result):
+    service, clients = trending_metadata_service(settings_factory, complete=False)
+    original_call = clients.call_ytmusic
+    search_calls = []
+
+    def lookup(method, *args, **kwargs):
+        if method == "search":
+            search_calls.append(args)
+            return search_result
+        return original_call(method, *args, **kwargs)
+
+    monkeypatch.setattr(clients, "call_ytmusic", lookup)
+    first, _, _ = service.trending("US", "1")
+    second, _, _ = service.trending("US", "1")
+    assert first == second
+    assert first[0]["videoId"] == "chart-0"
+    assert len(search_calls) == 2
+
+
+def test_trending_route_preserves_order_quality_and_cache_headers(settings_factory):
+    from app import create_app
+
+    clients = TrendingMetadataClients()
+    app = create_app(settings_obj=settings_factory(), clients_obj=clients)
+    with app.test_client() as client:
+        first = client.get("/trending?country=us&limit=2")
+        second = client.get("/trending?country=US&limit=1")
+    assert first.status_code == second.status_code == 200
+    assert first.headers["X-Cache"] == "miss"
+    assert second.headers["X-Cache"] == "hit"
+    assert first.get_json() == [clients.track(0), clients.track(1)]
+    assert second.get_json() == [clients.track(0)]
+    assert clients.method_counts == {"get_charts": 1}
 
 
 def test_singleflight_prevents_duplicate_trending_fetches(settings_factory):

@@ -14,7 +14,7 @@ from cache_layer import (
     key_for_billboard,
     key_for_mix,
     key_for_recommendations,
-    key_for_trending,
+    key_for_trending_country,
     stable_sha256,
 )
 from services.thumbnail_quality import normalize_thumbnails
@@ -354,9 +354,25 @@ class HotEndpointsService:
             return [{"id": None, "name": song_like.get("artist")}]
         return []
 
+    @staticmethod
+    def _needs_trending_enrichment(video):
+        artists = video.get("artists")
+        return not (
+            video.get("videoId")
+            and video.get("title")
+            and isinstance(artists, list)
+            and artists
+            and all(isinstance(artist, dict) and artist.get("name") for artist in artists)
+            and (video.get("duration") or video.get("duration_seconds"))
+            and any(
+                isinstance(thumb, dict) and thumb.get("url")
+                for thumb in video.get("thumbnails") or []
+            )
+        )
+
     def _enrich_trending_song(self, video):
-        if not isinstance(video, dict):
-            return video
+        if not isinstance(video, dict) or not self._needs_trending_enrichment(video):
+            return video, "hit", False
 
         title = video.get("title", "")
         artists = video.get("artists", [])
@@ -372,42 +388,82 @@ class HotEndpointsService:
 
         query = f"{title} {artist_name}".strip()
         if not query:
-            return video
+            return video, "hit", False
 
-        try:
+        def fetch_match():
             search_results = self.clients.call_ytmusic("search", query, filter="songs")
-            return search_results[0] if isinstance(search_results, list) and search_results else video
+            if (
+                not isinstance(search_results, list)
+                or not search_results
+                or not isinstance(search_results[0], dict)
+                or not search_results[0].get("videoId")
+            ):
+                raise ValueError("No song metadata found")
+            return search_results[0]
+
+        cache_key = self._subcache_key("trending_enrichment", {
+            "video_id": video.get("videoId"),
+            "query": " ".join(query.split()).casefold(),
+        })
+        try:
+            match, state, stale = self._with_cache_sync(
+                cache_key,
+                self.settings.cache_ttl_subcache_song_sec,
+                self.settings.cache_stale_subcache_song_sec,
+                fetch_match,
+            )
+            # Keep chart identity and ranking fields; fill only missing metadata.
+            enriched = dict(match)
+            enriched.update({
+                key: value for key, value in video.items()
+                if value not in (None, "", [], {})
+            })
+            return enriched, state, stale
         except Exception as exc:
             self.logger.warning("Failed to enrich trending song '%s': %s", query, exc)
-            return video
+            return video, "miss", False
 
     def trending(self, country, limit_value):
         limit = parse_limit(limit_value, default=50, minimum=1, maximum=50)
         normalized_country = (country or "US").strip().upper() or "US"
-        cache_key = key_for_trending(normalized_country, limit)
+        cache_key = key_for_trending_country(normalized_country)
 
         def fetch():
             charts = self.clients.call_ytmusic("get_charts", country=normalized_country)
-            trending_video_items = self.get_trending_video_items(charts, limit)
-            with ThreadPoolExecutor(max_workers=self.settings.max_workers_trending) as executor:
-                futures = [executor.submit(self._enrich_trending_song, item) for item in trending_video_items]
-                output = []
-                for index, future in enumerate(futures):
-                    try:
-                        output.append(
-                            future.result(timeout=self.settings.upstream_timeout_sec + 1.0)
-                        )
-                    except Exception as exc:
-                        self.logger.warning("Trending enrichment failed at index %s: %s", index, exc)
-                        output.append(trending_video_items[index])
-            return output
+            return self.get_trending_video_items(charts, 50)
 
-        return self._with_cache_sync(
+        tracks, cache_state, stale_fallback = self._with_cache_sync(
             cache_key,
             self.settings.cache_ttl_trending_sec,
             self.settings.cache_stale_trending_sec,
             fetch,
         )
+        output = tracks[:limit]
+        incomplete = [
+            index for index, track in enumerate(output)
+            if self._needs_trending_enrichment(track)
+        ]
+        if incomplete:
+            worker_count = min(self.settings.max_workers_trending, len(incomplete))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    index: executor.submit(self._enrich_trending_song, output[index])
+                    for index in incomplete
+                }
+                for index, future in futures.items():
+                    try:
+                        output[index], enrichment_state, enrichment_stale = future.result(
+                            timeout=self.settings.upstream_timeout_sec + 1.0
+                        )
+                        if enrichment_stale:
+                            cache_state, stale_fallback = "stale", True
+                        elif enrichment_state == "miss" and cache_state == "hit":
+                            cache_state = "miss"
+                    except Exception as exc:
+                        self.logger.warning("Trending enrichment failed at index %s: %s", index, exc)
+                        if cache_state == "hit":
+                            cache_state = "miss"
+        return output, cache_state, stale_fallback
 
     def _with_subcache_sync(self, namespace, key_data, fetch_fn):
         cache_key = self._subcache_key(namespace, key_data)

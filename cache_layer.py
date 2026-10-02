@@ -45,6 +45,11 @@ def key_for_trending(country, limit):
     return f"trending:{digest}"
 
 
+def key_for_trending_country(country):
+    normalized_country = str(country or "US").strip().upper() or "US"
+    return f"trending:country:{stable_sha256({'country': normalized_country})}"
+
+
 def key_for_billboard(week_key):
     return f"billboard:hot-100:{week_key}"
 
