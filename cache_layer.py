@@ -9,6 +9,7 @@ from flask import has_request_context, request
 from flask_caching import Cache
 from redis import from_url as redis_from_url
 from redis.exceptions import RedisError
+from memory_cache import BoundedMemoryCache
 
 
 @dataclass
@@ -77,6 +78,11 @@ class CacheLayer:
         }
         if cache_type == "RedisCache" and redis_url:
             config["CACHE_REDIS_URL"] = redis_url
+        if cache_type == "memory_cache.BoundedMemoryCache":
+            config["CACHE_OPTIONS"] = {
+                "max_bytes": self.settings.cache_memory_max_bytes,
+                "max_entry_bytes": self.settings.cache_memory_max_entry_bytes,
+            }
         return config
 
     def _initialize_cache(self, flask_app):
@@ -91,7 +97,7 @@ class CacheLayer:
         }
 
         if self.settings.cache_backend == "simple":
-            flask_app.config.update(self._cache_config("SimpleCache"))
+            flask_app.config.update(self._cache_config("memory_cache.BoundedMemoryCache"))
             self.logger.info(
                 "Cache initialized with backend=%s mode=%s",
                 cache_status["backend"],
@@ -127,12 +133,12 @@ class CacheLayer:
                 ) from exc
 
             self.logger.warning(
-                "Redis startup check failed (%s). Falling back to SimpleCache.", exc
+                "Redis startup check failed (%s). Falling back to memory caching.", exc
             )
             cache_status["backend"] = "simple"
             cache_status["degraded"] = True
             cache_status["healthy"] = True
-            flask_app.config.update(self._cache_config("SimpleCache"))
+            flask_app.config.update(self._cache_config("memory_cache.BoundedMemoryCache"))
             cache_instance = Cache(flask_app)
             return cache_instance, cache_status, self.settings.cache_fail_open
 
@@ -243,7 +249,7 @@ class CacheLayer:
         return headers
 
     def health_snapshot(self):
-        return {
+        snapshot = {
             "backend": self.status["backend"],
             "configured_backend": self.status["configured_backend"],
             "degraded": self.status["degraded"],
@@ -253,3 +259,6 @@ class CacheLayer:
             "last_error": self.status["last_error"],
             "metrics": self.metrics.copy(),
         }
+        if isinstance(self.cache.cache, BoundedMemoryCache):
+            snapshot["memory"] = self.cache.cache.snapshot()
+        return snapshot

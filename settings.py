@@ -71,6 +71,8 @@ class Settings:
     cache_redis_connect_timeout: float
     cache_default_timeout: int
     cache_threshold: int
+    cache_memory_max_bytes: int
+    cache_memory_max_entry_bytes: int
     cache_key_prefix: str
     cache_jitter_pct: float
     enable_stale_fallback: bool
@@ -194,6 +196,16 @@ class Settings:
                 os.getenv("CACHE_THRESHOLD", "5000"),
                 default=5000,
                 minimum=100,
+            ),
+            cache_memory_max_bytes=parse_int(
+                os.getenv("CACHE_MEMORY_MAX_BYTES", "67108864"),
+                default=64 * 1024 * 1024,
+                minimum=1024 * 1024,
+            ),
+            cache_memory_max_entry_bytes=parse_int(
+                os.getenv("CACHE_MEMORY_MAX_ENTRY_BYTES", "8388608"),
+                default=8 * 1024 * 1024,
+                minimum=1024,
             ),
             cache_key_prefix=str(os.getenv("CACHE_KEY_PREFIX", "ytmusic_api_")).strip(),
             cache_jitter_pct=parse_float(

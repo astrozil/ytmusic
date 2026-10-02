@@ -2,6 +2,39 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Memory Bounds and Lock Retention Optimization
+
+- The `simple` backend and Redis startup fallback now use `BoundedMemoryCache`,
+  a thread-safe per-process LRU backend compatible with Flask-Caching. The existing
+  `CACHE_THRESHOLD` (5000 by default) is a strict entry cap, alongside new
+  `CACHE_MEMORY_MAX_BYTES` (67108864 / 64 MiB) and `CACHE_MEMORY_MAX_ENTRY_BYTES`
+  (8388608 / 8 MiB). Environment values have minimums of 1 MiB total and 1 KiB per
+  entry; the effective entry limit is capped to the total budget.
+- The byte budget counts serialized values plus UTF-8 encoded keys. It bounds
+  retained cache content, not the process's total RSS, Python container overhead,
+  or transient serialization/deserialization and upstream response allocations.
+- Expired entries release their bytes on access, capacity pressure, or health
+  snapshots. Capacity eviction uses least recently read/written entries, with
+  expired entries removed before live entries under pressure. Reads still return
+  isolated payload copies and deserialize outside the cache lock.
+- Oversized entries skip caching and return fresh responses normally. An oversized
+  replacement removes its old cached value rather than leaving it as a fresh hit;
+  unrelated entries are preserved. `/health` adds `cache.memory` with current
+  entries/bytes, limits, eviction/expiry counts, and oversized skips. Healthy Redis
+  keeps its existing backend and does not apply the per-process memory policy.
+- Single-flight locks use a guarded weak-value registry: holders and waiters keep
+  the same lock alive, while unused locks are reclaimed instead of retaining every
+  historical key. Async waiters acquire cooperatively without creating executor
+  jobs that can acquire a lock after their coroutine has been cancelled.
+- Validation: 209 tests pass, including strict byte/count caps, LRU/expiry order,
+  concurrent cache mutation and atomic add/increment, Redis fallback configuration,
+  lock reclamation, mixed sync/async followers, and cancellation recovery.
+  A 20,000-key synthetic check with a 4 MiB budget stayed at 127 entries/~4.175 MB
+  serialized bytes and zero retained locks; traced retained allocations remained
+  ~4.224 MB at both 10,000 and 20,000 keys. Anonymous live trending, song, related,
+  mix, and Billboard routes returned 200 and then cache hits; Billboard matched
+  all 100 tracks. Live cache usage was 197 entries/~698 KB, with zero retained locks.
+
 ## 2026-10-02 Proactive Refresh and Prewarm Optimization
 
 - With `ENABLE_PREWARM=true`, the worker checks configured trending countries and

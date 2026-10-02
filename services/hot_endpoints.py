@@ -3,6 +3,7 @@ import random
 import threading
 import time
 import uuid
+import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -47,7 +48,8 @@ class HotEndpointsService:
         self.cache_layer = cache_layer
         self.settings = settings
         self.logger = logger
-        self._singleflight_locks = {}
+        # Hold locks only while callers retain them, including callers waiting to acquire.
+        self._singleflight_locks = weakref.WeakValueDictionary()
         self._singleflight_lock_guard = threading.Lock()
         self._distributed_singleflight_client = None
         self._distributed_singleflight_enabled = bool(
@@ -260,7 +262,10 @@ class HotEndpointsService:
 
         stale_payload = cached.payload if cached.state in ("hit", "stale") else None
         lock = self._get_singleflight_lock(cache_key)
-        await asyncio.to_thread(lock.acquire)
+        # Waiting in the event loop avoids abandoned executor jobs acquiring locks
+        # after their coroutine was cancelled, and avoids a thread per async waiter.
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
         try:
             cached_after_lock = self.cache_layer.get_envelope(cache_key)
             if self._cache_hit_usable(cached_after_lock, refresh_after_sec):
