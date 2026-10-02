@@ -32,10 +32,20 @@ class PrewarmManager:
             minimum=3600,
             maximum=86400,
         )
+        # Short TTLs and negative jitter must not outlive the refresh cadence.
+        self.trending_interval_sec = min(
+            self.trending_interval_sec,
+            max(1, int(settings.cache_ttl_trending_sec * (1 - settings.cache_jitter_pct) * 0.5)),
+        )
+        self.billboard_interval_sec = min(
+            self.billboard_interval_sec,
+            max(1, int(settings.cache_ttl_billboard_sec * (1 - settings.cache_jitter_pct) * 0.5)),
+        )
 
         self._stop_event = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
+        self._cycle_lock = threading.Lock()
         self._started_at = None
         self._iteration_count = 0
 
@@ -52,6 +62,8 @@ class PrewarmManager:
             "last_duration_ms": None,
             "success_count": 0,
             "failure_count": 0,
+            "consecutive_failures": 0,
+            "refresh_count": 0,
             "last_error": None,
             "next_due_at": next_due_at,
         }
@@ -105,37 +117,60 @@ class PrewarmManager:
         hot_service = self.hot_service_getter()
         loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(hot_service.billboard())
+            payload, cache_state, stale_fallback = loop.run_until_complete(
+                hot_service.billboard(refresh_after_sec=self.billboard_interval_sec)
+            )
+            rows = payload.get("data", []) if isinstance(payload, dict) else []
+            if stale_fallback or not rows or any(
+                not row.get("ytmusic_result", {}).get("videoId") for row in rows
+            ):
+                raise RuntimeError("Billboard prewarm returned stale or incomplete data")
+            return cache_state == "miss"
         finally:
             loop.close()
 
     def _run_trending(self):
         hot_service = self.hot_service_getter()
+        refreshed = False
+        failures = []
+        # The largest result warms every smaller slice of the shared country cache.
+        limit = max(self.trending_limits)
         for country in self.trending_countries:
-            for limit in self.trending_limits:
-                payload, cache_state, stale_fallback = hot_service.trending(country, str(limit))
-                item_count = len(payload) if isinstance(payload, list) else None
-                self.logger.info(
-                    "Prewarm trending refreshed country=%s limit=%s cache_state=%s stale=%s items=%s",
-                    country,
-                    limit,
-                    cache_state,
-                    stale_fallback,
-                    item_count,
+            if self._stop_event.is_set():
+                break
+            try:
+                payload, cache_state, stale_fallback = hot_service.trending(
+                    country, str(limit), refresh_after_sec=self.trending_interval_sec,
                 )
+                if stale_fallback or not payload:
+                    raise RuntimeError("Trending prewarm returned stale or empty data")
+                refreshed = refreshed or cache_state == "miss"
+                item_count = len(payload) if isinstance(payload, list) else None
+                if cache_state != "hit":
+                    self.logger.info(
+                        "Prewarm trending refreshed country=%s limit=%s items=%s",
+                        country, limit, item_count,
+                    )
+            except Exception as exc:
+                failures.append(f"{country}: {exc}")
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        return refreshed
 
     def _is_due(self, endpoint_name, now_ts):
         with self._lock:
             next_due_at = self._endpoint_state[endpoint_name]["next_due_at"]
         return next_due_at is None or now_ts >= next_due_at
 
-    def _record_endpoint_success(self, endpoint_name, now_ts, duration_ms, next_due_at):
+    def _record_endpoint_success(self, endpoint_name, now_ts, duration_ms, next_due_at, refreshed):
         with self._lock:
             state = self._endpoint_state[endpoint_name]
             state["last_run_at"] = _iso_utc(now_ts)
             state["last_success_at"] = _iso_utc(now_ts)
             state["last_duration_ms"] = duration_ms
             state["success_count"] += 1
+            state["consecutive_failures"] = 0
+            state["refresh_count"] += int(refreshed)
             state["last_error"] = None
             state["next_due_at"] = next_due_at
 
@@ -145,6 +180,7 @@ class PrewarmManager:
             state["last_run_at"] = _iso_utc(now_ts)
             state["last_duration_ms"] = duration_ms
             state["failure_count"] += 1
+            state["consecutive_failures"] += 1
             state["last_error"] = str(exc)
             state["next_due_at"] = next_due_at
 
@@ -157,53 +193,57 @@ class PrewarmManager:
             interval_sec = self.billboard_interval_sec
             runner = self._run_billboard
 
-        next_due_at = now_ts + interval_sec
-
         try:
-            runner()
+            refreshed = runner()
             duration_ms = int((time.perf_counter() - started) * 1000)
             self._record_endpoint_success(
                 endpoint_name=endpoint_name,
                 now_ts=now_ts,
                 duration_ms=duration_ms,
-                next_due_at=next_due_at,
+                next_due_at=now_ts + duration_ms / 1000.0 + self.loop_tick_sec,
+                refreshed=refreshed,
             )
-            self.logger.info(
-                "Prewarm %s succeeded duration_ms=%s next_due_in_sec=%s",
-                endpoint_name,
-                duration_ms,
-                interval_sec,
-            )
+            if refreshed:
+                self.logger.info("Prewarm %s refreshed duration_ms=%s", endpoint_name, duration_ms)
         except Exception as exc:
             duration_ms = int((time.perf_counter() - started) * 1000)
+            with self._lock:
+                failures = self._endpoint_state[endpoint_name]["consecutive_failures"]
+            retry_sec = min(interval_sec, 3600, max(60, self.loop_tick_sec) * 2**min(failures, 6))
             self._record_endpoint_failure(
                 endpoint_name=endpoint_name,
                 now_ts=now_ts,
                 duration_ms=duration_ms,
-                next_due_at=next_due_at,
+                next_due_at=now_ts + duration_ms / 1000.0 + retry_sec,
                 exc=exc,
             )
             self.logger.warning(
                 "Prewarm %s failed duration_ms=%s next_due_in_sec=%s error=%s",
                 endpoint_name,
                 duration_ms,
-                interval_sec,
+                retry_sec,
                 exc,
             )
 
     def run_cycle_once(self, now_ts=None):
-        now_ts = time.time() if now_ts is None else float(now_ts)
-        ran_any = False
-
-        with self._lock:
-            self._iteration_count += 1
-
-        for endpoint_name in ("trending", "billboard"):
-            if self._is_due(endpoint_name, now_ts):
-                ran_any = True
-                self._run_endpoint(endpoint_name, now_ts)
-
-        return ran_any
+        if not self._cycle_lock.acquire(blocking=False):
+            return False
+        try:
+            ran_any = False
+            with self._lock:
+                self._iteration_count += 1
+            for endpoint_name in ("trending", "billboard"):
+                if self._stop_event.is_set():
+                    break
+                # Poll fresh keys cheaply, so eviction, short-lived partial results,
+                # and Billboard's new week are noticed before the normal refresh age.
+                endpoint_now = time.time() if now_ts is None else float(now_ts)
+                if self._is_due(endpoint_name, endpoint_now):
+                    ran_any = True
+                    self._run_endpoint(endpoint_name, endpoint_now)
+            return ran_any
+        finally:
+            self._cycle_lock.release()
 
     def snapshot(self):
         with self._lock:

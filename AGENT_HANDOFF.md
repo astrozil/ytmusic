@@ -2,6 +2,38 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Proactive Refresh and Prewarm Optimization
+
+- With `ENABLE_PREWARM=true`, the worker checks configured trending countries and
+  the current Billboard week every `PREWARM_LOOP_TICK_SEC` after a successful check.
+  Recent cache hits perform no chart fetch. Aging envelopes refresh using their
+  actual `fetched_at`, before the normal fresh TTL expires, through the existing
+  local/distributed single-flight locks. Concurrent public reads retain the old
+  fresh entry while the new result is built; no cache entry is deleted for refresh.
+- Refresh ages retain the previous interval caps, but are bounded to half the
+  earliest jittered TTL. Short TTLs no longer inherit the previous 300/3600-second
+  minimums. The polling tick and upstream duration still affect actual timing.
+- The worker warms only the largest configured trending limit once per country.
+  It continues other countries when one fails. Overlapping worker/manual cycles
+  are skipped, and stop requests prevent starting the next country or endpoint.
+- Trending chart refreshes also refresh aging playlist dependencies, rather than
+  keeping the playlist's longer artist-subcache TTL. This also applies to expired
+  foreground charts when prewarming is disabled. Failed/empty chart or playlist
+  refreshes preserve old envelopes and their original TTLs; fallback playlist data
+  is not re-cached as a fresh country chart.
+- Stale/empty trending and stale/incomplete Billboard warm results count as
+  failures. Failures retry with exponential backoff starting at 60 seconds (or the
+  shorter refresh age), capped at the refresh age or one hour. Successful checks
+  reset the failure streak. `/health` adds `consecutive_failures` and `refresh_count`;
+  existing success/failure counters remain, and routine hit checks do not log refreshes.
+- Validation: 185 tests pass, including concurrent refresh/read behavior, sync and
+  async distributed followers, cache preservation/recovery, eviction, new chart
+  weeks, short jittered TTLs, per-country isolation, and failure backoff.
+  Anonymous live checks warmed 100 playable Billboard matches. Recent checks made
+  zero upstream calls (~14ms including route reads). Aging only in-memory fetched
+  timestamps triggered chart + playlist + Billboard fetches in ~1.25s, with zero
+  new song searches; subsequent trending/Billboard requests returned 200/cache hits.
+
 ## 2026-10-02 Upstream Deadline and Retry Optimization
 
 - `call_ytmusic()` and `http_get()` now treat `timeout` (or

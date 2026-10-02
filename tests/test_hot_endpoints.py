@@ -463,7 +463,7 @@ def test_distributed_singleflight_waits_for_leader_result(settings_factory):
 
     service._try_acquire_distributed_lock = lambda cache_key, token: False
     service._wait_for_distributed_refresh = (
-        lambda cache_key, stale_payload=None: ({"value": "leader"}, "hit", False)
+        lambda cache_key, stale_payload=None, refresh_after_sec=None: ({"value": "leader"}, "hit", False)
     )
 
     payload, state, stale_flag = service._with_cache_sync("distributed:key", 60, 120, _never_fetch)
@@ -516,7 +516,7 @@ def test_distributed_singleflight_async_waits_for_leader_result(settings_factory
 
     service._try_acquire_distributed_lock = lambda cache_key, token: False
     service._wait_for_distributed_refresh = (
-        lambda cache_key, stale_payload=None: ({"value": "leader-async"}, "hit", False)
+        lambda cache_key, stale_payload=None, refresh_after_sec=None: ({"value": "leader-async"}, "hit", False)
     )
 
     payload, state, stale_flag = asyncio.run(

@@ -150,7 +150,18 @@ class HotEndpointsService:
                 exc,
             )
 
-    def _wait_for_distributed_refresh(self, cache_key, stale_payload=None):
+    @staticmethod
+    def _cache_hit_usable(cached, refresh_after_sec=None):
+        if cached.state != "hit":
+            return False
+        if refresh_after_sec is None or cached.envelope is None:
+            return True
+        return time.time() < min(
+            cached.envelope["fetched_at"] + refresh_after_sec,
+            cached.envelope["fresh_until"],
+        )
+
+    def _wait_for_distributed_refresh(self, cache_key, stale_payload=None, refresh_after_sec=None):
         poll_interval_sec = max(
             0.01,
             float(self.settings.distributed_singleflight_poll_ms) / 1000.0,
@@ -162,9 +173,9 @@ class HotEndpointsService:
 
         while time.monotonic() < deadline:
             cached = self.cache_layer.get_envelope(cache_key)
-            if cached.state == "hit":
+            if self._cache_hit_usable(cached, refresh_after_sec):
                 return cached.payload, "hit", False
-            if cached.state == "stale":
+            if cached.state in ("hit", "stale"):
                 latest_stale_payload = cached.payload
             time.sleep(poll_interval_sec)
 
@@ -177,19 +188,19 @@ class HotEndpointsService:
             return latest_stale_payload, "stale", True
         return None
 
-    def _with_cache_sync(self, cache_key, fresh_ttl, stale_ttl, fetch_fn, ttl_resolver=None):
+    def _with_cache_sync(self, cache_key, fresh_ttl, stale_ttl, fetch_fn, ttl_resolver=None, refresh_after_sec=None):
         cached = self.cache_layer.get_envelope(cache_key)
-        if cached.state == "hit":
+        if self._cache_hit_usable(cached, refresh_after_sec):
             return cached.payload, "hit", False
 
-        stale_payload = cached.payload if cached.state == "stale" else None
+        stale_payload = cached.payload if cached.state in ("hit", "stale") else None
         lock = self._get_singleflight_lock(cache_key)
 
         with lock:
             cached_after_lock = self.cache_layer.get_envelope(cache_key)
-            if cached_after_lock.state == "hit":
+            if self._cache_hit_usable(cached_after_lock, refresh_after_sec):
                 return cached_after_lock.payload, "hit", False
-            if cached_after_lock.state == "stale":
+            if cached_after_lock.state in ("hit", "stale"):
                 stale_payload = cached_after_lock.payload
 
             distributed_lock_token = None
@@ -204,6 +215,7 @@ class HotEndpointsService:
                     waited_result = self._wait_for_distributed_refresh(
                         cache_key,
                         stale_payload=stale_payload,
+                        refresh_after_sec=refresh_after_sec,
                     )
                     if waited_result is not None:
                         return waited_result
@@ -241,19 +253,19 @@ class HotEndpointsService:
                 ):
                     self._release_distributed_lock(cache_key, distributed_lock_token)
 
-    async def _with_cache_async(self, cache_key, fresh_ttl, stale_ttl, fetch_coro, ttl_resolver=None):
+    async def _with_cache_async(self, cache_key, fresh_ttl, stale_ttl, fetch_coro, ttl_resolver=None, refresh_after_sec=None):
         cached = self.cache_layer.get_envelope(cache_key)
-        if cached.state == "hit":
+        if self._cache_hit_usable(cached, refresh_after_sec):
             return cached.payload, "hit", False
 
-        stale_payload = cached.payload if cached.state == "stale" else None
+        stale_payload = cached.payload if cached.state in ("hit", "stale") else None
         lock = self._get_singleflight_lock(cache_key)
         await asyncio.to_thread(lock.acquire)
         try:
             cached_after_lock = self.cache_layer.get_envelope(cache_key)
-            if cached_after_lock.state == "hit":
+            if self._cache_hit_usable(cached_after_lock, refresh_after_sec):
                 return cached_after_lock.payload, "hit", False
-            if cached_after_lock.state == "stale":
+            if cached_after_lock.state in ("hit", "stale"):
                 stale_payload = cached_after_lock.payload
 
             distributed_lock_token = None
@@ -270,6 +282,7 @@ class HotEndpointsService:
                         self._wait_for_distributed_refresh,
                         cache_key,
                         stale_payload,
+                        refresh_after_sec,
                     )
                     if waited_result is not None:
                         return waited_result
@@ -314,7 +327,7 @@ class HotEndpointsService:
         finally:
             lock.release()
 
-    def get_trending_video_items(self, charts, limit):
+    def get_trending_video_items(self, charts, limit, playlist_refresh_after_sec=None):
         if isinstance(charts, dict):
             raw_videos = next(
                 (charts[key] for key in ("videos", "daily", "weekly") if charts.get(key)),
@@ -341,7 +354,9 @@ class HotEndpointsService:
             last_error = None
             for playlist in sorted(playlists, key=playlist_priority):
                 try:
-                    payload = self._get_cached_playlist(playlist["playlistId"])
+                    payload = self._get_cached_playlist(
+                        playlist["playlistId"], refresh_after_sec=playlist_refresh_after_sec,
+                    )
                     tracks = [
                         track for track in payload.get("tracks", [])
                         if isinstance(track, dict) and track.get("videoId")
@@ -435,20 +450,29 @@ class HotEndpointsService:
             self.logger.warning("Failed to enrich trending song '%s': %s", query, exc)
             return video, "miss", False
 
-    def trending(self, country, limit_value):
+    def trending(self, country, limit_value, *, refresh_after_sec=None):
         limit = parse_limit(limit_value, default=50, minimum=1, maximum=50)
         normalized_country = (country or "US").strip().upper() or "US"
         cache_key = key_for_trending_country(normalized_country)
 
         def fetch():
             charts = self.clients.call_ytmusic("get_charts", country=normalized_country)
-            return self.get_trending_video_items(charts, 50)
+            tracks = self.get_trending_video_items(
+                charts, 50, playlist_refresh_after_sec=(
+                    self.settings.cache_ttl_trending_sec
+                    if refresh_after_sec is None else refresh_after_sec
+                ),
+            )
+            if not tracks:
+                raise ValueError("Charts returned no trending tracks")
+            return tracks
 
         tracks, cache_state, stale_fallback = self._with_cache_sync(
             cache_key,
             self.settings.cache_ttl_trending_sec,
             self.settings.cache_stale_trending_sec,
             fetch,
+            refresh_after_sec=refresh_after_sec,
         )
         output = tracks[:limit]
         incomplete = [
@@ -481,13 +505,14 @@ class HotEndpointsService:
         payload, _, _ = self._with_subcache_result_sync(namespace, key_data, fetch_fn)
         return payload
 
-    def _with_subcache_result_sync(self, namespace, key_data, fetch_fn):
+    def _with_subcache_result_sync(self, namespace, key_data, fetch_fn, refresh_after_sec=None):
         cache_key = self._subcache_key(namespace, key_data)
         return self._with_cache_sync(
             cache_key=cache_key,
             fresh_ttl=self.settings.cache_ttl_subcache_artist_sec,
             stale_ttl=self.settings.cache_stale_subcache_artist_sec,
             fetch_fn=fetch_fn,
+            refresh_after_sec=refresh_after_sec,
         )
 
     def _get_cached_watch_playlist(self, song_id):
@@ -523,16 +548,28 @@ class HotEndpointsService:
             ),
         )
 
-    def _get_cached_playlist(self, playlist_id):
-        return self._with_subcache_sync(
+    def _get_cached_playlist(self, playlist_id, refresh_after_sec=None):
+        def fetch():
+            payload = self.clients.call_ytmusic(
+                "get_playlist", playlist_id, timeout=self.settings.upstream_timeout_sec * 2,
+            )
+            if refresh_after_sec is not None and not any(
+                isinstance(track, dict) and track.get("videoId")
+                for track in payload.get("tracks", [])
+            ):
+                raise ValueError("Chart playlist returned no playable tracks")
+            return payload
+
+        payload, _, stale = self._with_subcache_result_sync(
             "playlist",
             {"playlist_id": str(playlist_id).strip()},
-            lambda: self.clients.call_ytmusic(
-                "get_playlist",
-                playlist_id,
-                timeout=self.settings.upstream_timeout_sec * 2,
-            ),
+            fetch,
+            refresh_after_sec=refresh_after_sec,
         )
+        if refresh_after_sec is not None and stale:
+            # Let the country cache report fallback instead of re-caching old tracks as fresh.
+            raise RuntimeError("Chart playlist refresh returned stale data")
+        return payload
 
     def _get_cached_artist_albums(self, browse_id, params):
         return self._with_subcache_sync(
@@ -1129,7 +1166,7 @@ class HotEndpointsService:
         current_tuesday = today - timedelta(days=days_since_tuesday)
         return current_tuesday.strftime("%Y-%m-%d")
 
-    async def billboard(self):
+    async def billboard(self, *, refresh_after_sec=None):
         week_key = self._billboard_week_key()
         cache_key = key_for_billboard(week_key)
         stale_matches = False
@@ -1179,6 +1216,7 @@ class HotEndpointsService:
             self.settings.cache_stale_billboard_sec,
             fetch,
             ttl_resolver=cache_ttls,
+            refresh_after_sec=refresh_after_sec,
         )
         if stale_matches:
             return payload, "stale", True

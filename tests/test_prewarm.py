@@ -11,17 +11,17 @@ class FakeHotService:
         self.fail_trending = False
         self.fail_billboard = False
 
-    def trending(self, country, limit_value):
+    def trending(self, country, limit_value, **kwargs):
         self.trending_calls += 1
         if self.fail_trending:
             raise RuntimeError("trending failed")
         return [{"country": country, "limit": limit_value}], "miss", False
 
-    async def billboard(self):
+    async def billboard(self, **kwargs):
         self.billboard_calls += 1
         if self.fail_billboard:
             raise RuntimeError("billboard failed")
-        return {"data": [], "metadata": {}}, "miss", False
+        return {"data": [{"ytmusic_result": {"videoId": "v1"}}], "metadata": {}}, "miss", False
 
 
 def wait_until(predicate, timeout_sec=2.0):
@@ -123,7 +123,7 @@ def test_prewarm_failure_updates_state_and_continues(settings_factory):
 
     assert first_snapshot["endpoints"]["trending"]["failure_count"] == 1
     assert first_snapshot["endpoints"]["trending"]["success_count"] == 0
-    assert first_snapshot["endpoints"]["trending"]["last_error"] == "trending failed"
+    assert first_snapshot["endpoints"]["trending"]["last_error"] == "US: trending failed"
     assert second_snapshot["endpoints"]["trending"]["failure_count"] == 1
     assert second_snapshot["endpoints"]["trending"]["success_count"] == 1
 
