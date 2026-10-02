@@ -2,6 +2,33 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Render Memory-Cache Startup Compatibility Fix
+
+- Reproduced the reported `ignore_delete_many_errors` constructor TypeError using
+  Flask-Caching 2.5.1/cachelib 0.17.0 installed in an isolated temporary directory.
+  The prior local environment used Flask-Caching 2.3.1/cachelib 0.13.0, whose
+  factory did not supply that keyword, so earlier tests missed the deploy mismatch.
+- `BoundedMemoryCache` now accepts both legacy `ignore_errors` and the renamed
+  `ignore_delete_many_errors`. An explicit renamed value takes precedence; both
+  attributes reflect the effective setting for inherited deletion behavior on
+  either library generation. Memory limits, serialization, and cache policy are
+  unchanged. Requirements pin Flask-Caching 2.5.1 and cachelib 0.17.0 to the
+  verified deployment pair rather than allowing those dependencies to drift.
+- Validation: all 304 tests pass under both library pairs. New integration tests
+  construct the backend through Flask-Caching with old/new options, exercise
+  bulk deletion and memory bounds, check explicit-option precedence, and confirm
+  ignored deletion failures allow later keys to be deleted. App startup, /health
+  HTTP 200, and cache read/write smoke checks passed with the new pair for direct
+  memory selection and simulated Redis DNS fallback. Render was not verified.
+- Render still selected Redis in the supplied log despite the repository default
+  and Blueprint selecting `simple`. The existing service environment must change
+  `CACHE_BACKEND` to `simple` to honor the user's memory-cache preference and stop
+  Redis DNS checks. Browser-control initialization failed twice (Windows sandbox
+  ACL helper failure), so the dashboard setting could not be changed here. The
+  constructor fix repairs memory startup even if that override is left in place
+  and Redis falls back. Subsequent older-style success logs may be a prior process;
+  they do not establish that this new revision deployed successfully.
+
 ## 2026-10-02 Repeatable Performance Benchmark Harness
 
 - Added `python -B -m benchmarks.run`, with usage and measurement definitions in

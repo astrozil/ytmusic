@@ -1,7 +1,8 @@
 flask[async]
 ytmusicapi==1.12.3
 beautifulsoup4
-flask_caching
+flask_caching==2.5.1
+cachelib==0.17.0
 flask_limiter
 billboard.py==7.1.0
 waitress

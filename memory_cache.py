@@ -12,9 +12,14 @@ class BoundedMemoryCache(BaseCache):
     serializer = SimpleSerializer()
 
     def __init__(self, threshold=5000, default_timeout=300, max_bytes=64 * 1024 * 1024,
-                 max_entry_bytes=8 * 1024 * 1024, ignore_errors=False):
+                 max_entry_bytes=8 * 1024 * 1024, ignore_errors=False,
+                 ignore_delete_many_errors=None):
         super().__init__(default_timeout=default_timeout)
-        self.ignore_errors = ignore_errors
+        # Flask-Caching 2.5 passes the renamed cachelib option to all factories.
+        # Keep both attributes for inherited delete_many on old and new releases.
+        ignore_deletes = ignore_errors if ignore_delete_many_errors is None else ignore_delete_many_errors
+        self.ignore_errors = ignore_deletes
+        self.ignore_delete_many_errors = ignore_deletes
         self._threshold = max(1, int(threshold))
         self._max_bytes = max(1, int(max_bytes))
         self._max_entry_bytes = min(self._max_bytes, max(1, int(max_entry_bytes)))

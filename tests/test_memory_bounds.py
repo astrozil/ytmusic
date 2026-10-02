@@ -10,10 +10,52 @@ from dataclasses import replace
 
 import pytest
 from flask import Flask
+from flask_caching import Cache
 
 from cache_layer import CacheLayer
 from memory_cache import BoundedMemoryCache
 from services.hot_endpoints import HotEndpointsService
+
+
+@pytest.mark.parametrize("ignore", [False, True])
+@pytest.mark.parametrize("renamed_option", [False, True])
+def test_flask_cache_factory_accepts_legacy_and_renamed_delete_options(ignore, renamed_option):
+    app = Flask(__name__)
+    options = {"max_bytes": 1024, "max_entry_bytes": 512}
+    if renamed_option:
+        options["ignore_delete_many_errors"] = ignore
+    cache = Cache(app, config={
+        "CACHE_TYPE": "memory_cache.BoundedMemoryCache", "CACHE_THRESHOLD": 2,
+        "CACHE_DEFAULT_TIMEOUT": 77, "CACHE_IGNORE_ERRORS": ignore, "CACHE_OPTIONS": options,
+    })
+    backend = cache.cache
+    assert backend.ignore_errors is backend.ignore_delete_many_errors is ignore
+    assert backend.default_timeout == 77
+    assert cache.set("a", {"items": [1]})
+    assert cache.set("b", {"items": [2]})
+    assert cache.get("a") == {"items": [1]}
+    assert cache.delete_many("a", "b") == ["a", "b"]
+    assert backend.snapshot()["serialized_bytes"] == 0
+    for index in range(10):
+        cache.set(str(index), "x" * 200)
+    assert backend.snapshot()["entries"] <= 2
+    assert backend.snapshot()["serialized_bytes"] <= 1024
+
+
+def test_explicit_renamed_delete_option_overrides_legacy_option():
+    cache = BoundedMemoryCache(ignore_errors=True, ignore_delete_many_errors=False)
+    assert cache.ignore_errors is cache.ignore_delete_many_errors is False
+
+
+def test_ignored_delete_failure_continues_to_later_keys(monkeypatch):
+    cache = BoundedMemoryCache(ignore_delete_many_errors=True)
+    for key in ("blocked", "a", "b"):
+        cache.set(key, key)
+    delete = cache.delete
+    monkeypatch.setattr(cache, "delete", lambda key: False if key == "blocked" else delete(key))
+    assert cache.delete_many("blocked", "a", "b") == ["a", "b"]
+    assert cache.has("blocked")
+    assert not cache.has("a") and not cache.has("b")
 
 
 def test_memory_limit_defaults_and_invalid_values(settings_factory, monkeypatch):
