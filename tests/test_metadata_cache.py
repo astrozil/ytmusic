@@ -240,9 +240,7 @@ def test_batch_artists_preserves_duplicates_order_and_partial_failures(metadata_
 
 def test_concurrent_song_routes_share_one_upstream_request(metadata_app):
     app, clients = metadata_app
-    # Initialize the shared service before the concurrent cold song requests.
-    with app.test_client() as client:
-        client.get("/artist/a1")
+    assert app.extensions["ytmusic_hot_service"] is None
     clients.started = threading.Event()
     clients.release = threading.Event()
     barrier = threading.Barrier(8)

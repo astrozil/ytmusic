@@ -5,7 +5,7 @@ import time
 import uuid
 import weakref
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from datetime import datetime, timedelta
 
 from redis import from_url as redis_from_url
@@ -20,6 +20,7 @@ from cache_layer import (
 )
 from services.thumbnail_quality import normalize_thumbnails
 from services.billboard_chart import BillboardChart
+from workers import batch_executor
 
 
 def format_thumbnails(thumbnails, video_id=None):
@@ -485,8 +486,7 @@ class HotEndpointsService:
             if self._needs_trending_enrichment(track)
         ]
         if incomplete:
-            worker_count = min(self.settings.max_workers_trending, len(incomplete))
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            with batch_executor(self.settings.max_workers_trending, len(incomplete)) as executor:
                 futures = {
                     index: executor.submit(self._enrich_trending_song, output[index])
                     for index in incomplete
@@ -666,7 +666,7 @@ class HotEndpointsService:
 
         def fetch():
             all_tracks = []
-            with ThreadPoolExecutor(max_workers=self.settings.max_workers_recommendations) as executor:
+            with batch_executor(self.settings.max_workers_recommendations, len(song_ids)) as executor:
                 futures = {
                     executor.submit(self._fetch_recommendation_seed, song_id): song_id
                     for song_id in song_ids
@@ -776,11 +776,7 @@ class HotEndpointsService:
 
             album_details_by_id = {}
             if release_album_ids:
-                worker_count = min(
-                    max(1, self.settings.max_workers_artist_songs),
-                    len(release_album_ids),
-                )
-                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                with batch_executor(self.settings.max_workers_artist_songs, len(release_album_ids)) as executor:
                     future_to_album = {
                         executor.submit(self._get_cached_album, album_id): album_id
                         for album_id in release_album_ids
@@ -856,8 +852,7 @@ class HotEndpointsService:
                 return []
 
             ordered_results = [None] * len(song_ids)
-            worker_count = min(max(1, self.settings.max_workers_songs), len(song_ids))
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            with batch_executor(self.settings.max_workers_songs, len(song_ids)) as executor:
                 futures = {
                     executor.submit(self._fetch_single_song, song_id, transform_fn): idx
                     for idx, song_id in enumerate(song_ids)
@@ -1024,7 +1019,7 @@ class HotEndpointsService:
             all_songs_by_artist = {artist_id: [] for artist_id in initial_artists}
             exhausted_artists = set()
             targets = dict(requested_sizes)
-            with ThreadPoolExecutor(max_workers=self.settings.max_workers_mix) as executor:
+            with batch_executor(self.settings.max_workers_mix, len(normalized_artist_ids)) as executor:
                 while targets:
                     futures = {
                         executor.submit(self._fetch_artist_songs, artist_id, target): artist_id

@@ -20,6 +20,7 @@ def settings_factory(monkeypatch):
             "UPSTREAM_TIMEOUT_SEC": "1",
             "UPSTREAM_RETRY_ATTEMPTS": "0",
             "UPSTREAM_RETRY_BACKOFF_MS": "25",
+            "UPSTREAM_MAX_WORKERS": "0",
             "MAX_WORKERS_TRENDING": "4",
             "MAX_WORKERS_RECOMMENDATIONS": "4",
             "MAX_WORKERS_MIX": "4",

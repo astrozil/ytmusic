@@ -2,6 +2,39 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Initialization and Worker Tuning Optimization
+
+- Lazy client/service construction now shares a per-app reentrant lock and checks
+  again after acquiring it. Concurrent first requests and prewarm access publish
+  exactly one client and one service, preserving shared upstream capacity and
+  single-flight locks. Failed constructors can retry; a ready client survives a
+  service-construction failure. Root/health probes remain lazy and responsive
+  during initialization. Failed SDK construction closes both HTTP sessions.
+- Trending enrichment, recommendations, artist releases, song batches, mixes,
+  and the artist batch route use `workers.batch_executor`. Single-item or
+  explicitly serial batches run their orchestration inline, retaining Future-based
+  partial-error handling. Larger batches cap worker count to available items;
+  mixes retain their pool across expansion rounds. Artist duplicates still return
+  in requested order, and recommendation seed frequency weighting is preserved.
+- `UPSTREAM_MAX_WORKERS` controls the shared upstream executor, admission slots,
+  and both HTTP connection pools together. Default `0` preserves automatic sizing
+  (`max(16, mix + recommendations + trending workers)`, 26 with production defaults).
+  Explicit values support 1 through 256; invalid/negative values use automatic
+  sizing and larger values clamp to 256. No deployment environment change is
+  required. Lower limits trade throughput for less concurrency; choose limits from
+  hosting capacity and measured load. Existing deadline/retry behavior is retained.
+- Batch orchestration stays separate from the upstream executor to avoid tasks
+  waiting on work submitted into the same saturated pool. Named batch/upstream
+  threads make worker inspection easier. Multi-item pools still live per batch;
+  this change does not introduce shared orchestration queues or change Waitress.
+- Validation: 233 tests pass, including mixed cold request/prewarm races,
+  initialization recovery, lazy health probes, all six singleton route paths,
+  multi-item parallelism, and saturated admission at an explicit two-worker limit.
+  Anonymous live checks with that limit returned 200 and usable trending, mix,
+  song/artist batch, and recommendation data. Eight simultaneous cold song reads
+  produced one miss/seven hits. The singleton route checks needed one upstream
+  thread and retained zero batch threads. Render deployment was not inspected.
+
 ## 2026-10-02 Memory Bounds and Lock Retention Optimization
 
 - The `simple` backend and Redis startup fallback now use `BoundedMemoryCache`,

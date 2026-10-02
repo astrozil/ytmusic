@@ -56,7 +56,7 @@ class UpstreamClients:
     def __init__(self, settings, logger):
         self.settings = settings
         self.logger = logger
-        executor_size = max(
+        executor_size = settings.upstream_max_workers or max(
             16,
             settings.max_workers_mix
             + settings.max_workers_recommendations
@@ -69,10 +69,17 @@ class UpstreamClients:
         self._ytmusic_http = self._pooled_session(
             executor_size, self._deadline_state, raise_retryable_status=True,
         )
-        self.ytmusic = YTMusic(
-            settings.ytmusic_auth_file, requests_session=self._ytmusic_http,
+        try:
+            self.ytmusic = YTMusic(
+                settings.ytmusic_auth_file, requests_session=self._ytmusic_http,
+            )
+        except BaseException:
+            self.http.close()
+            self._ytmusic_http.close()
+            raise
+        self._ytmusic_executor = ThreadPoolExecutor(
+            max_workers=executor_size, thread_name_prefix="ytmusic-upstream",
         )
-        self._ytmusic_executor = ThreadPoolExecutor(max_workers=executor_size)
 
     @staticmethod
     def _pooled_session(pool_size, deadline_state, raise_retryable_status=False):

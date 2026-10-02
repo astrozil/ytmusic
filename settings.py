@@ -84,6 +84,7 @@ class Settings:
     upstream_timeout_sec: float
     upstream_retry_attempts: int
     upstream_retry_backoff_ms: int
+    upstream_max_workers: int
 
     max_workers_trending: int
     max_workers_recommendations: int
@@ -257,6 +258,12 @@ class Settings:
                 default=200,
                 minimum=25,
                 maximum=5000,
+            ),
+            upstream_max_workers=parse_int(
+                os.getenv("UPSTREAM_MAX_WORKERS", "0"),
+                default=0,
+                minimum=0,
+                maximum=256,
             ),
             max_workers_trending=parse_int(
                 os.getenv("MAX_WORKERS_TRENDING", "8"),

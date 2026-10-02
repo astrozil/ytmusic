@@ -2,8 +2,9 @@ import atexit
 import logging
 import os
 import re
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from urllib.parse import quote
 
 from flask import Flask, abort, jsonify, request
@@ -22,6 +23,7 @@ from services.thumbnail_quality import (
     select_best_thumbnail,
 )
 from settings import Settings
+from workers import batch_executor
 
 
 logging.basicConfig(level=logging.INFO)
@@ -286,24 +288,30 @@ def create_app(
     cache_layer = cache_layer_obj or CacheLayer(app, settings_obj, logger)
     clients = clients_obj
     hot_service = hot_service_obj
+    initialization_lock = threading.RLock()
 
     def get_clients():
         nonlocal clients
         if clients is None:
-            clients = UpstreamClients(settings_obj, logger)
-            app.extensions["ytmusic_clients"] = clients
+            with initialization_lock:
+                if clients is None:
+                    clients = UpstreamClients(settings_obj, logger)
+                    app.extensions["ytmusic_clients"] = clients
         return clients
 
     def get_hot_service():
         nonlocal hot_service
         if hot_service is None:
-            hot_service = HotEndpointsService(
-                clients=get_clients(),
-                cache_layer=cache_layer,
-                settings=settings_obj,
-                logger=logger,
-            )
-            app.extensions["ytmusic_hot_service"] = hot_service
+            # Service construction calls get_clients(), requiring a reentrant lock.
+            with initialization_lock:
+                if hot_service is None:
+                    hot_service = HotEndpointsService(
+                        clients=get_clients(),
+                        cache_layer=cache_layer,
+                        settings=settings_obj,
+                        logger=logger,
+                    )
+                    app.extensions["ytmusic_hot_service"] = hot_service
         return hot_service
 
     limiter = None
@@ -628,10 +636,11 @@ def create_app(
                 }
 
         artists_data = []
-        with ThreadPoolExecutor(max_workers=settings_obj.max_concurrency_artist_lookup) as executor:
+        unique_artist_ids = list(dict.fromkeys(artist_ids))
+        with batch_executor(settings_obj.max_concurrency_artist_lookup, len(unique_artist_ids)) as executor:
             future_to_artist = {
                 executor.submit(fetch_artist_info, artist_id): artist_id
-                for artist_id in dict.fromkeys(artist_ids)
+                for artist_id in unique_artist_ids
             }
             for future in as_completed(future_to_artist):
                 try:

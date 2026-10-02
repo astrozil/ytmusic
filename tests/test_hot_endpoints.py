@@ -139,6 +139,33 @@ class ServiceFakeClients:
         raise RuntimeError(f"Unexpected ytmusic call: {method_name}")
 
 
+@pytest.mark.parametrize("method,path,body", [
+    ("get", "/trending?limit=1", None),
+    ("get", "/artist/a1/songs", None),
+    ("get", "/mix?artists=a1&limit=3", None),
+    ("post", "/songs", {"song_ids": ["s1"]}),
+    ("post", "/recommendations", {"song_ids": ["s1"]}),
+    ("post", "/artists", {"artist_ids": ["a1", "a1"]}),
+])
+def test_singleton_routes_do_not_create_batch_threads(settings_factory, monkeypatch, method, path, body):
+    from app import create_app
+
+    def unexpected_pool(**kwargs):
+        pytest.fail("Singleton route started an orchestration pool")
+
+    monkeypatch.setattr("workers.ThreadPoolExecutor", unexpected_pool)
+    app = create_app(settings_obj=settings_factory(), clients_obj=ServiceFakeClients())
+    with app.test_client() as client:
+        response = getattr(client, method)(path, json=body)
+    assert response.status_code == 200
+    payload = response.get_json()
+    if path == "/artists":
+        assert len(payload["artists"]) == payload["total_successful"] == 2
+    else:
+        assert payload
+        assert all("error" not in item for item in payload)
+
+
 class RouteFakeClients:
     def call_ytmusic(self, method_name, *args, **kwargs):
         if method_name == "search":

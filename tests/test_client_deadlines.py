@@ -12,7 +12,7 @@ from clients import UpstreamClients
 
 
 @pytest.fixture
-def upstream(settings_factory, monkeypatch):
+def upstream(settings_factory, monkeypatch, request):
     class ControlledYTMusic:
         def __init__(self, auth, requests_session):
             self.session = requests_session
@@ -28,7 +28,9 @@ def upstream(settings_factory, monkeypatch):
 
     monkeypatch.setattr("clients.YTMusic", ControlledYTMusic)
     monkeypatch.setattr("clients.random.uniform", lambda low, high: 0)
-    clients = UpstreamClients(settings_factory(UPSTREAM_RETRY_ATTEMPTS="3"), logging.getLogger(__name__))
+    clients = UpstreamClients(settings_factory(
+        UPSTREAM_RETRY_ATTEMPTS="3", UPSTREAM_MAX_WORKERS=getattr(request, "param", 0),
+    ), logging.getLogger(__name__))
     try:
         yield clients
     finally:
@@ -101,6 +103,7 @@ def test_retry_backoff_and_attempts_share_one_budget(upstream):
     assert upstream.ytmusic.calls <= 3
 
 
+@pytest.mark.parametrize("upstream", [0, 2], indirect=True)
 def test_saturation_keeps_timed_out_workers_charged_and_does_not_queue(upstream, monkeypatch):
     workers = upstream._ytmusic_executor._max_workers
     release = threading.Event()
