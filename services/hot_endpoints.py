@@ -1139,6 +1139,7 @@ class HotEndpointsService:
             chart = await asyncio.to_thread(
                 BillboardChart, "hot-100", timeout=self.settings.upstream_timeout_sec * 2,
                 max_retries=self.settings.upstream_retry_attempts,
+                http_get=lambda *args, **kwargs: self.clients.http_get(*args, **kwargs),
             )
             chart_entries = list(chart)
             billboard_sem = asyncio.Semaphore(self.settings.max_concurrency_billboard)

@@ -1,9 +1,33 @@
 """Compatibility parser for Billboard's labelled chart statistics."""
 
-from billboard import BillboardParseException, ChartData, ChartEntry
+from billboard import BillboardNotFoundException, BillboardParseException, ChartData, ChartEntry
+from bs4 import BeautifulSoup
 
 
 class BillboardChart(ChartData):
+    def __init__(self, *args, http_get=None, **kwargs):
+        self._http_get = http_get
+        super().__init__(*args, **kwargs)
+
+    def fetchEntries(self):
+        if self._http_get is None:
+            return super().fetchEntries()
+        if self.date:
+            url = f"https://www.billboard.com/charts/{self.name}/{self.date}"
+        elif self.year:
+            url = f"https://www.billboard.com/charts/year-end/{self.year}/{self.name}"
+        else:
+            url = f"https://www.billboard.com/charts/{self.name}"
+        # Use the shared transport's total budget instead of a second retry layer.
+        response = self._http_get(url, timeout=self._timeout, retries=self._max_retries)
+        try:
+            if response.status_code == 404:
+                raise BillboardNotFoundException("Chart not found (perhaps the name is misspelled?)")
+            response.raise_for_status()
+            self._parsePage(BeautifulSoup(response.text, "html.parser"))
+        finally:
+            response.close()
+
     def _parseNewStylePage(self, soup):
         rows = soup.select("ul.o-chart-results-list-row")
         # Older pages still use the positional layout supported by billboard.py.

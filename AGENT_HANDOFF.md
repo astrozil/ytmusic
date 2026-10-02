@@ -2,6 +2,37 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Upstream Deadline and Retry Optimization
+
+- `call_ytmusic()` and `http_get()` now treat `timeout` (or
+  `UPSTREAM_TIMEOUT_SEC`) as one total caller budget, covering worker admission,
+  all attempts, and retry backoff. Previously the budget restarted every attempt.
+- Both Requests sessions inherit each worker's remaining deadline for connect/read
+  timeouts. A multi-request YTMusic operation cannot start another HTTP request
+  after its deadline. Thread-local state keeps concurrent calls independent.
+- A bounded admission semaphore matches executor capacity. A caller timeout
+  cancels unstarted work, and a running worker keeps its slot until completion;
+  timeout does not spawn another overlapping retry or allow unlimited queuing.
+- Retry only transient connection/read failures, HTTP 429, and HTTP 5xx. Parser,
+  input, authentication, gated-access, and certificate failures are not retried.
+  HTTP GET preserves the final response status/body and closes discarded responses.
+- HTTP `Retry-After` seconds and dates are respected; no retry starts if the wait
+  would exceed the remaining budget. YTMusic HTTP overload errors are classified
+  before JSON parsing, including HTML error pages.
+- Billboard chart fetching uses the shared HTTP client, removing its separate
+  Requests session and nested adapter retries from the service path. Chart parsing
+  and the existing chart-not-found exception are preserved.
+- Python threads cannot forcibly stop arbitrary running code. Requests socket
+  timeouts bound normal network waits, while the caller budget and admission guard
+  remain effective for slow parsing or other non-cooperative worker code. This
+  is a per-upstream-call budget, not a whole Flask request or lyrics-provider budget.
+- Existing worker/pool size settings and explicit retry overrides remain supported.
+- Validation: 167 tests pass, covering real delayed HTTP, saturation after caller
+  timeouts, queued cancellation, thread-local socket budgets, transient/permanent
+  failures, Retry-After, pooled connection reuse, and Billboard transport/parsing.
+  Anonymous live Flask checks returned 200 for trending, song, related, mix, and
+  Billboard. Hot 100 contained 100 playable matches (~10.6s cold, ~10ms cached).
+
 ## 2026-10-02 Billboard Match Cache Optimization
 
 - Successful Billboard song searches now share a per-song cache keyed by normalized

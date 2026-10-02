@@ -1,8 +1,49 @@
 import pytest
-from billboard import BillboardParseException
+import requests
+from billboard import BillboardNotFoundException, BillboardParseException
 from bs4 import BeautifulSoup
+from unittest.mock import Mock
 
 from services.billboard_chart import BillboardChart
+
+
+@pytest.mark.parametrize("options,path", [
+    ({}, "hot-100"),
+    ({"date": "2026-10-03"}, "hot-100/2026-10-03"),
+    ({"year": "2025"}, "year-end/2025/hot-100"),
+])
+def test_chart_fetch_uses_shared_transport_and_preserves_url(options, path):
+    response = Mock(status_code=200, text=labelled_chart())
+    fetch = Mock(return_value=response)
+    chart = BillboardChart("hot-100", fetch=False, http_get=fetch,
+                           timeout=4, max_retries=2, **options)
+    chart._parsePage = Mock(wraps=chart._parsePage if not options.get("year") else lambda soup: None)
+    chart.fetchEntries()
+    fetch.assert_called_once_with(f"https://www.billboard.com/charts/{path}", timeout=4, retries=2)
+    chart._parsePage.assert_called_once()
+    response.close.assert_called_once()
+    if not options.get("year"):
+        assert chart[0].title == "A & B"
+
+
+@pytest.mark.parametrize("status,error", [(404, BillboardNotFoundException), (403, requests.HTTPError)])
+def test_chart_fetch_preserves_http_errors_and_closes_response(status, error):
+    response = Mock(status_code=status)
+    response.raise_for_status.side_effect = requests.HTTPError("Forbidden")
+    fetch = Mock(return_value=response)
+    with pytest.raises(error):
+        BillboardChart("hot-100", http_get=fetch, timeout=1, max_retries=0)
+    fetch.assert_called_once()
+    response.close.assert_called_once()
+
+
+def test_chart_parser_failure_is_not_retried_and_closes_response():
+    response = Mock(status_code=200, text="<html>Invalid chart</html>")
+    fetch = Mock(return_value=response)
+    with pytest.raises(BillboardParseException):
+        BillboardChart("hot-100", http_get=fetch, timeout=1, max_retries=3)
+    fetch.assert_called_once()
+    response.close.assert_called_once()
 
 
 def labelled_chart(last="-", weeks="7"):
