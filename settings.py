@@ -85,6 +85,8 @@ class Settings:
     upstream_retry_attempts: int
     upstream_retry_backoff_ms: int
     upstream_max_workers: int
+    lyrics_timeout_sec: float
+    lyrics_provider_timeout_sec: float
 
     max_workers_trending: int
     max_workers_recommendations: int
@@ -264,6 +266,12 @@ class Settings:
                 default=0,
                 minimum=0,
                 maximum=256,
+            ),
+            lyrics_timeout_sec=parse_float(
+                os.getenv("LYRICS_TIMEOUT_SEC", "12"), default=12.0, minimum=0.5, maximum=60.0,
+            ),
+            lyrics_provider_timeout_sec=parse_float(
+                os.getenv("LYRICS_PROVIDER_TIMEOUT_SEC", "3"), default=3.0, minimum=0.1, maximum=10.0,
             ),
             max_workers_trending=parse_int(
                 os.getenv("MAX_WORKERS_TRENDING", "8"),

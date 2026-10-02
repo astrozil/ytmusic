@@ -2,6 +2,47 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Lyrics Budgets and Deduplication Optimization
+
+- `/lyrics` delegates lookup and caching to `services/lyrics.py`. Provider order
+  remains LRCLIB, Genius, then lyrics.ovh, with the full artist and primary artist
+  candidates. Plain/synced lyrics, source, normalizedArtist, and original request
+  title/artist fields remain compatible. Cache keys retain case/whitespace
+  normalization. Provider requests clean title spacing and skip duplicate URLs;
+  URL-sensitive lyrics.ovh artist/title values remain percent-encoded.
+- `LYRICS_TIMEOUT_SEC` defaults to 12 seconds (range 0.5-60), replacing up to six
+  independent ten-second HTTP budgets. `LYRICS_PROVIDER_TIMEOUT_SEC` defaults to
+  3 seconds (range 0.1-10). Each HTTP call receives the smaller of that cap and
+  its share of the remaining lookup budget, reserving time for later fallbacks.
+  Existing upstream admission, retries, and backoff fit inside that call's budget.
+  This bounds provider work and follower waits, not arbitrary Python execution or
+  lazy client-constructor duration; timed-out running upstream workers retain
+  their bounded admission slots until they finish, as before.
+- A guarded per-app registry shares one Future among simultaneous requests for
+  the same normalized title/artist. Owners recheck caches; followers share the
+  result or error even if cache writes are skipped/fail open. Different songs
+  progress independently. Completed flights are removed, each follower has its
+  own remaining wait budget, and a follower timeout does not cancel the owner.
+  Sharing is per process, consistent with the selected memory-cache deployment.
+- Fresh/stale positive cache hits and active negative cache entries still return
+  immediately without initializing upstream clients. Completed provider misses
+  remain 404 with exponential negative-cache backoff, now starting at completion
+  time so slow lookups do not consume their own backoff. Success resets failure
+  state. Large failure counts saturate safely at the configured TTL cap.
+- Timeouts, connection errors, invalid JSON, HTTP 408/429, and HTTP 5xx return 503
+  if no later provider succeeds. They do not create/increase missing-song cache
+  entries, allowing later recovery. Permanent misses/access denials still fall
+  through the normal chain. Blank title/artist values return 400. HTTP responses
+  close after parsing, including misses and failures; no Genius access bypass.
+- Validation: 267 tests pass, including six concurrent-result/cache-failure
+  combinations, independent songs, timed-out followers, fallback time reservation,
+  real slow HTTP deadline enforcement, transient recovery, completion-time backoff,
+  provider URL deduplication, stale hits, and flight cleanup. An anonymous live
+  LRCLIB check for `'Cause You Have To` by LANY served eight simultaneous requests
+  with one provider call in ~0.551 seconds. A warm request added zero provider calls,
+  synced metadata was preserved, and zero flights remained. No lyric text was
+  printed; these checks used a local app, not the deployed Render service.
+
 ## 2026-10-02 Initialization and Worker Tuning Optimization
 
 - Lazy client/service construction now shares a per-app reentrant lock and checks
