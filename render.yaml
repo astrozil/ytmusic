@@ -1,0 +1,14 @@
+# Optional Blueprint configuration. Existing manually managed services must
+# set their Health Check Path to /health in the Render dashboard.
+services:
+  - type: web
+    name: ytmusic
+    runtime: python
+    repo: https://github.com/astrozil/ytmusic
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: CACHE_BACKEND
+        value: simple

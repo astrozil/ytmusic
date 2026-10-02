@@ -126,9 +126,9 @@ class Settings:
 
     @classmethod
     def from_env(cls):
-        cache_backend = str(os.getenv("CACHE_BACKEND", "redis")).strip().lower()
+        cache_backend = str(os.getenv("CACHE_BACKEND", "simple")).strip().lower()
         if cache_backend not in {"redis", "simple"}:
-            cache_backend = "redis"
+            cache_backend = "simple"
 
         cache_ttl_billboard = parse_int(
             os.getenv("CACHE_TTL_BILLBOARD_SEC", "604800"),

@@ -54,6 +54,27 @@ This file captures the major context and decisions from the recent multi-step re
 
 ## Current State Summary
 
+### 2026-10-02 Startup and Connection Pool Follow-up
+
+- User explicitly chose memory caching. CACHE_BACKEND now defaults to simple,
+  including invalid values, and render.yaml sets CACHE_BACKEND=simple. Explicit
+  CACHE_BACKEND=redis remains supported; remove/change any such existing Render
+  environment override to use the user's selected memory backend.
+- Added GET / with service status and a /health link; Flask also serves HEAD /
+  with HTTP 200 for platform probes. /health continues providing detailed status.
+- Added an optional Render Blueprint with the existing build/start commands and
+  healthCheckPath=/health. It is not automatically applied to a manually created
+  service. Browser control failed at Windows sandbox initialization, so existing
+  Render dashboard settings could not be edited in this session.
+- Both Requests sessions now use blocking connection pools sized to the YTMusic
+  executor. YTMusic receives its own configured session through requests_session;
+  its original 30-second socket timeout is preserved. This removes the default
+  pool size 10 bottleneck during concurrent Billboard enrichment.
+- Validation: 57 tests pass. A local HTTP server received two bursts of 12
+  concurrent calls over the same 12 connections with no pool-full warnings.
+  GET/HEAD / return 200; default startup with an obsolete REDIS_URL reports
+  backend=simple, configured_backend=simple, degraded=false, startup_error=null.
+
 - App is a Flask + Waitress API (`app.py`) with modular services:
   - `settings.py` (env parsing/defaults)
   - `cache_layer.py` (cache envelope + safe cache access)

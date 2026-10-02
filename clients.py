@@ -1,6 +1,7 @@
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from functools import partial
 
 import requests
 from ytmusicapi import YTMusic
@@ -16,17 +17,33 @@ class UpstreamClients:
     def __init__(self, settings, logger):
         self.settings = settings
         self.logger = logger
-        self.ytmusic = YTMusic(settings.ytmusic_auth_file)
-        self.http = requests.Session()
-        self.http.headers.update({"User-Agent": DEFAULT_USER_AGENT})
-
         executor_size = max(
             16,
             settings.max_workers_mix
             + settings.max_workers_recommendations
             + settings.max_workers_trending,
         )
+        self.http = self._pooled_session(executor_size)
+        self.http.headers.update({"User-Agent": DEFAULT_USER_AGENT})
+        self._ytmusic_http = self._pooled_session(executor_size)
+        # Passing a custom session bypasses ytmusicapi's default 30s timeout.
+        # Preserve it so timed-out worker calls cannot wait on sockets forever.
+        self._ytmusic_http.request = partial(self._ytmusic_http.request, timeout=30)
+        self.ytmusic = YTMusic(
+            settings.ytmusic_auth_file, requests_session=self._ytmusic_http,
+        )
         self._ytmusic_executor = ThreadPoolExecutor(max_workers=executor_size)
+
+    @staticmethod
+    def _pooled_session(pool_size):
+        session = requests.Session()
+        for scheme in ("http://", "https://"):
+            session.mount(scheme, requests.adapters.HTTPAdapter(
+                pool_connections=pool_size,
+                pool_maxsize=pool_size,
+                pool_block=True,
+            ))
+        return session
 
     def _retry_sleep(self, attempt):
         base_delay = self.settings.upstream_retry_backoff_ms / 1000.0

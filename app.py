@@ -664,6 +664,10 @@ def create_app(
             ]
         return jsonify(enhance_payload_thumbnails(response_data))
 
+    @app.route("/", methods=["GET"])
+    def index():
+        return jsonify({"service": "YTMusic API", "status": "ok", "health": "/health"})
+
     @app.route("/health", methods=["GET"])
     def health_check():
         return (
