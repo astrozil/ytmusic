@@ -98,6 +98,8 @@ class Settings:
     cache_ttl_songs_sec: int
     cache_ttl_lyrics_sec: int
     cache_ttl_billboard_sec: int
+    cache_ttl_billboard_match_sec: int
+    cache_stale_billboard_match_sec: int
     cache_ttl_subcache_seed_sec: int
     cache_ttl_subcache_artist_sec: int
     cache_ttl_subcache_song_sec: int
@@ -139,6 +141,16 @@ class Settings:
             os.getenv("CACHE_STALE_BILLBOARD_SEC", "1209600"),
             default=1209600,
             minimum=cache_ttl_billboard,
+        )
+        cache_ttl_billboard_match = parse_int(
+            os.getenv("CACHE_TTL_BILLBOARD_MATCH_SEC", "2592000"),
+            default=2592000,
+            minimum=60,
+        )
+        cache_stale_billboard_match = parse_int(
+            os.getenv("CACHE_STALE_BILLBOARD_MATCH_SEC", "5184000"),
+            default=5184000,
+            minimum=cache_ttl_billboard_match,
         )
         cache_ttl_lyrics = parse_int(
             os.getenv("CACHE_TTL_LYRICS_SEC", "300"),
@@ -303,6 +315,8 @@ class Settings:
             ),
             cache_ttl_lyrics_sec=cache_ttl_lyrics,
             cache_ttl_billboard_sec=cache_ttl_billboard,
+            cache_ttl_billboard_match_sec=cache_ttl_billboard_match,
+            cache_stale_billboard_match_sec=cache_stale_billboard_match,
             cache_ttl_subcache_seed_sec=parse_int(
                 os.getenv("CACHE_TTL_SUBCACHE_SEED_SEC", "21600"),
                 default=21600,

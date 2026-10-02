@@ -2,6 +2,28 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Billboard Match Cache Optimization
+
+- Successful Billboard song searches now share a per-song cache keyed by normalized
+  title and artist, independently of chart week, rank, or statistics. Duplicate
+  concurrent lookups use the existing single-flight protection.
+- `CACHE_TTL_BILLBOARD_MATCH_SEC` defaults to 2592000 (30 days), and
+  `CACHE_STALE_BILLBOARD_MATCH_SEC` defaults to 5184000 (60 days). The latter
+  is an overall cache lifetime, including the fresh period. Memory entries remain
+  subject to eviction and reset on process restart.
+- Every chart rebuild assembles rank, lastPos, peakPos, weeks, and chart date from
+  the newly fetched chart; cached matches contain only the YouTube Music result.
+- Empty, invalid, or failed searches are not stored as successful song matches.
+  An incomplete chart is cached fresh for at most 60 seconds (plus configured
+  jitter), with at most 120 seconds of overall retention, instead of a full week.
+- Stale song matches may supplement current chart rows during upstream failure;
+  `/billboard` reports `X-Cache: stale` and `X-Data-Stale: 1`. These results are
+  not stored as a fresh chart, so a later request can retry the match refresh.
+- Validation: 126 tests pass. Anonymous live Hot 100 check matched all 100 songs;
+  cold build took ~11.0s (100 song and 89 artist searches), forced chart rebuild
+  took ~1.1s with zero additional YouTube Music calls, and endpoint hit took ~1ms.
+  Rank, lastPos, peakPos, and weeks were identical across the two live chart fetches.
+
 ## 2026-10-02 Trending Repair
 
 - Reproduced deployed `get_charts` failure locally with ytmusicapi 1.11.5:

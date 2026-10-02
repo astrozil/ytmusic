@@ -241,7 +241,7 @@ class HotEndpointsService:
                 ):
                     self._release_distributed_lock(cache_key, distributed_lock_token)
 
-    async def _with_cache_async(self, cache_key, fresh_ttl, stale_ttl, fetch_coro):
+    async def _with_cache_async(self, cache_key, fresh_ttl, stale_ttl, fetch_coro, ttl_resolver=None):
         cached = self.cache_layer.get_envelope(cache_key)
         if cached.state == "hit":
             return cached.payload, "hit", False
@@ -286,7 +286,13 @@ class HotEndpointsService:
 
             try:
                 payload = await fetch_coro()
-                self.cache_layer.set_envelope(cache_key, payload, fresh_ttl, stale_ttl)
+                effective_fresh, effective_stale = (
+                    ttl_resolver(payload) if ttl_resolver else (fresh_ttl, stale_ttl)
+                )
+                if effective_fresh > 0 and effective_stale > 0:
+                    self.cache_layer.set_envelope(
+                        cache_key, payload, effective_fresh, effective_stale
+                    )
                 return payload, "miss", False
             except Exception as exc:
                 if stale_payload is not None and self.settings.enable_stale_fallback:
@@ -1061,17 +1067,39 @@ class HotEndpointsService:
         tasks = [asyncio.create_task(self._resolve_artist(name, artist_sem)) for name in artist_names]
         return await asyncio.gather(*tasks)
 
-    async def _fetch_billboard_song(self, entry, artist_sem):
-        try:
-            query = f"{entry.title} {entry.artist}"
-            search_results = await asyncio.to_thread(
-                self.clients.call_ytmusic,
-                "search",
-                query,
-                filter="songs",
+    def _get_cached_billboard_match(self, title, artist):
+        cache_key = self._subcache_key("billboard_match", {
+            "title": " ".join(str(title).casefold().split()),
+            "artist": " ".join(str(artist).casefold().split()),
+        })
+
+        def fetch():
+            results = self.clients.call_ytmusic(
+                "search", f"{title} {artist}", filter="songs",
                 timeout=self.settings.upstream_timeout_sec * 2,
             )
-            best_match = search_results[0] if search_results else {}
+            best_match = results[0] if results else None
+            video_id = best_match.get("videoId") if isinstance(best_match, dict) else None
+            if not isinstance(video_id, str) or not video_id.strip():
+                raise LookupError("No playable Billboard song match")
+            return best_match
+
+        try:
+            return self._with_cache_sync(
+                cache_key,
+                self.settings.cache_ttl_billboard_match_sec,
+                self.settings.cache_stale_billboard_match_sec,
+                fetch,
+            )
+        except LookupError:
+            # Keep an empty search retryable without changing the row schema.
+            return {}, "miss", False
+
+    async def _fetch_billboard_song(self, entry, artist_sem):
+        try:
+            best_match, _, stale_match = await asyncio.to_thread(
+                self._get_cached_billboard_match, entry.title, entry.artist,
+            )
             artists = await self._parse_and_fetch_artists(entry.artist, artist_sem)
             return {
                 "rank": entry.rank,
@@ -1081,7 +1109,7 @@ class HotEndpointsService:
                 "peakPos": entry.peakPos,
                 "weeks": entry.weeks,
                 "ytmusic_result": best_match,
-            }
+            }, stale_match
         except Exception as exc:
             self.logger.error("Error fetching details for %s: %s", entry.title, exc)
             return {
@@ -1092,7 +1120,7 @@ class HotEndpointsService:
                 "peakPos": entry.peakPos,
                 "weeks": entry.weeks,
                 "ytmusic_result": {},
-            }
+            }, False
 
     @staticmethod
     def _billboard_week_key():
@@ -1104,8 +1132,10 @@ class HotEndpointsService:
     async def billboard(self):
         week_key = self._billboard_week_key()
         cache_key = key_for_billboard(week_key)
+        stale_matches = False
 
         async def fetch():
+            nonlocal stale_matches
             chart = await asyncio.to_thread(
                 BillboardChart, "hot-100", timeout=self.settings.upstream_timeout_sec * 2,
                 max_retries=self.settings.upstream_retry_attempts,
@@ -1119,7 +1149,9 @@ class HotEndpointsService:
                     return await self._fetch_billboard_song(entry, artist_sem)
 
             tasks = [asyncio.create_task(process_entry(entry)) for entry in chart_entries]
-            songs = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks)
+            songs = [song for song, _ in results]
+            stale_matches = any(stale for _, stale in results)
             return {
                 "data": songs,
                 "metadata": {
@@ -1129,9 +1161,24 @@ class HotEndpointsService:
                 },
             }
 
-        return await self._with_cache_async(
+        def cache_ttls(payload):
+            if stale_matches:
+                # Retry stale matches rather than storing them as a fresh weekly chart.
+                return 0, 0
+            if any(not song["ytmusic_result"].get("videoId") for song in payload["data"]):
+                # Avoid retaining a temporary lookup failure for the entire chart week.
+                return min(60, self.settings.cache_ttl_billboard_sec), min(
+                    120, self.settings.cache_stale_billboard_sec
+                )
+            return self.settings.cache_ttl_billboard_sec, self.settings.cache_stale_billboard_sec
+
+        payload, state, stale_fallback = await self._with_cache_async(
             cache_key,
             self.settings.cache_ttl_billboard_sec,
             self.settings.cache_stale_billboard_sec,
             fetch,
+            ttl_resolver=cache_ttls,
         )
+        if stale_matches:
+            return payload, "stale", True
+        return payload, state, stale_fallback
