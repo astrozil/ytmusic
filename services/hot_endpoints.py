@@ -802,166 +802,180 @@ class HotEndpointsService:
             fetch,
         )
 
-    def _fetch_artist_songs(self, artist_id):
+    def _fetch_artist_songs(self, artist_id, target_count=None):
         artist_songs = []
+        seen = set()
+
+        def enough_candidates():
+            return target_count is not None and len(artist_songs) >= target_count
+
+        def add_tracks(tracks, album_info=None):
+            album_info = album_info or {}
+            for track in tracks:
+                if not isinstance(track, dict) or track.get("isAvailable") is False:
+                    continue
+                video_id = track.get("videoId")
+                if not video_id or video_id in seen:
+                    continue
+                seen.add(video_id)
+                artists = self._extract_artists(track) or self._extract_artists(album_info)
+                artist_songs.append({
+                    "title": track.get("title"),
+                    "videoId": video_id,
+                    "artists": artists,
+                    "album": album_info.get("title") or track.get("album"),
+                    "duration": track.get("duration"),
+                    "thumbnails": format_thumbnails(
+                        track.get("thumbnails") or album_info.get("thumbnails"),
+                        video_id=video_id,
+                    ),
+                })
+
         try:
             artist_info = self._get_cached_artist(artist_id)
         except Exception as exc:
             self.logger.error("Error retrieving artist %s: %s", artist_id, exc)
             return []
 
-        if "songs" in artist_info:
-            songs_data = artist_info["songs"]
-            songs_browse_id = songs_data.get("browseId")
-            if songs_browse_id:
-                try:
-                    playlist_data = self._get_cached_playlist(songs_browse_id)
-                    for track in playlist_data.get("tracks", []):
-                        artist_songs.append(
-                            {
-                                "title": track.get("title"),
-                                "videoId": track.get("videoId"),
-                                "artists": self._extract_artists(track),
-                                "album": None,
-                                "duration": track.get("duration"),
-                                "thumbnails": format_thumbnails(
-                                    track.get("thumbnails"),
-                                    video_id=track.get("videoId"),
-                                ),
-                            }
-                        )
-                except Exception as exc:
-                    self.logger.error(
-                        "Error fetching songs playlist for artist %s: %s", artist_id, exc
-                    )
-            else:
-                for song in songs_data.get("results", []):
-                    artist_songs.append(
-                        {
-                            "title": song.get("title"),
-                            "videoId": song.get("videoId"),
-                            "artists": self._extract_artists(song),
-                            "album": song.get("album"),
-                            "duration": song.get("duration"),
-                            "thumbnails": format_thumbnails(
-                                song.get("thumbnails"),
-                                video_id=song.get("videoId"),
-                            ),
-                        }
-                    )
-
-        for content_type in ["albums", "singles"]:
-            content_data = artist_info.get(content_type, {})
-            params = content_data.get("params")
-            if not params:
-                continue
+        songs_data = artist_info.get("songs") or {}
+        add_tracks(songs_data.get("results") or [])
+        songs_browse_id = songs_data.get("browseId")
+        if songs_browse_id and not enough_candidates():
             try:
-                releases_browse_id = content_data.get("browseId") or artist_id
-                releases = self._get_cached_artist_albums(releases_browse_id, params)
+                playlist_data = self._get_cached_playlist(songs_browse_id)
+                add_tracks(playlist_data.get("tracks") or [])
             except Exception as exc:
-                self.logger.error("Error fetching %s for artist %s: %s", content_type, artist_id, exc)
-                continue
+                self.logger.error(
+                    "Error fetching songs playlist for artist %s: %s", artist_id, exc
+                )
 
-            for release in releases:
-                album_id = release.get("browseId")
-                if not album_id:
-                    continue
+        release_ids = []
+        seen_release_ids = set()
+        for content_type in ["albums", "singles"]:
+            if enough_candidates():
+                break
+            content_data = artist_info.get(content_type) or {}
+            releases = content_data.get("results") or []
+            params = content_data.get("params")
+            if params:
                 try:
-                    album_info = self._get_cached_album(album_id)
-                    album_thumbnails = album_info.get("thumbnails", [])
-                    for track in album_info.get("tracks", []):
-                        raw_thumbnails = track.get("thumbnails") or album_thumbnails
-                        artists = self._extract_artists(track)
-                        if not artists and album_info.get("artists"):
-                            artists = [
-                                {"id": a.get("id") or a.get("channelId"), "name": a.get("name")}
-                                for a in album_info.get("artists")
-                            ]
-                        artist_songs.append(
-                            {
-                                "title": track.get("title"),
-                                "videoId": track.get("videoId"),
-                                "artists": artists,
-                                "album": album_info.get("title"),
-                                "duration": track.get("duration"),
-                                "thumbnails": format_thumbnails(
-                                    raw_thumbnails,
-                                    video_id=track.get("videoId"),
-                                ),
-                            }
-                        )
+                    releases_browse_id = content_data.get("browseId") or artist_id
+                    releases = self._get_cached_artist_albums(releases_browse_id, params)
                 except Exception as exc:
-                    self.logger.error("Error fetching album %s: %s", album_id, exc)
+                    self.logger.error("Error fetching %s for artist %s: %s", content_type, artist_id, exc)
 
-        seen = set()
-        unique_artist_songs = []
-        for song in artist_songs:
-            identifier = song.get("videoId") or song.get("title")
-            if identifier and identifier not in seen:
-                seen.add(identifier)
-                unique_artist_songs.append(song)
+            for release in releases or []:
+                album_id = release.get("browseId") if isinstance(release, dict) else None
+                if not album_id or album_id in seen_release_ids:
+                    continue
+                seen_release_ids.add(album_id)
+                release_ids.append(album_id)
 
-        random.shuffle(unique_artist_songs)
-        return unique_artist_songs
+        # Sample the release catalog rather than always taking the first albums.
+        random.shuffle(release_ids)
+        for album_id in release_ids:
+            if enough_candidates():
+                break
+            try:
+                album_info = self._get_cached_album(album_id)
+                add_tracks(album_info.get("tracks") or [], album_info)
+            except Exception as exc:
+                self.logger.error("Error fetching album %s: %s", album_id, exc)
+
+        random.shuffle(artist_songs)
+        return artist_songs[:target_count]
 
     @staticmethod
     def _create_balanced_mix(songs_by_artist, total_limit):
         if not songs_by_artist:
             return []
 
-        num_artists = len(songs_by_artist)
-        base_songs_per_artist = total_limit // num_artists
-        extra_songs = total_limit % num_artists
-
         result = []
+        seen = set()
         artist_indices = {artist_id: 0 for artist_id in songs_by_artist.keys()}
-        artists_list = list(songs_by_artist.keys())
+        active_artists = [artist_id for artist_id, songs in songs_by_artist.items() if songs]
+        random.shuffle(active_artists)
 
-        for _ in range(base_songs_per_artist):
-            for artist_id in artists_list:
+        while active_artists and len(result) < total_limit:
+            next_round = []
+            for artist_id in active_artists:
                 songs = songs_by_artist[artist_id]
-                if artist_indices[artist_id] < len(songs):
-                    result.append(songs[artist_indices[artist_id]])
+                while artist_indices[artist_id] < len(songs):
+                    song = songs[artist_indices[artist_id]]
                     artist_indices[artist_id] += 1
-
-        artist_idx = 0
-        for _ in range(extra_songs):
-            while artist_idx < len(artists_list):
-                artist_id = artists_list[artist_idx]
-                songs = songs_by_artist[artist_id]
+                    identifier = song.get("videoId") or song.get("title")
+                    if identifier and identifier not in seen:
+                        seen.add(identifier)
+                        result.append(song)
+                        break
                 if artist_indices[artist_id] < len(songs):
-                    result.append(songs[artist_indices[artist_id]])
-                    artist_indices[artist_id] += 1
-                    artist_idx += 1
+                    next_round.append(artist_id)
+                if len(result) >= total_limit:
                     break
-                artist_idx += 1
+            active_artists = next_round
 
         random.shuffle(result)
         return result[:total_limit]
 
     def mix(self, artist_ids, limit_value):
         limit = parse_limit(limit_value, default=50, minimum=1, maximum=200)
-        normalized_artist_ids = [artist_id.strip() for artist_id in artist_ids if artist_id and artist_id.strip()]
+        normalized_artist_ids = list(dict.fromkeys(
+            artist_id.strip() for artist_id in artist_ids
+            if isinstance(artist_id, str) and artist_id.strip()
+        ))
         cache_key = key_for_mix(normalized_artist_ids, limit)
 
         def fetch():
-            all_songs_by_artist = {}
+            if not normalized_artist_ids:
+                return []
+            # Two candidates per allocated slot leave room for variety and overlap.
+            artist_order = list(normalized_artist_ids)
+            random.shuffle(artist_order)
+            initial_artist_count = min(limit, len(artist_order))
+            initial_artists = artist_order[:initial_artist_count]
+            remaining_artists = artist_order[initial_artist_count:]
+            initial_target = 2 * ((limit + initial_artist_count - 1) // initial_artist_count)
+            requested_sizes = {artist_id: initial_target for artist_id in initial_artists}
+            all_songs_by_artist = {artist_id: [] for artist_id in initial_artists}
+            exhausted_artists = set()
+            targets = dict(requested_sizes)
             with ThreadPoolExecutor(max_workers=self.settings.max_workers_mix) as executor:
-                futures = {
-                    executor.submit(self._fetch_artist_songs, artist_id): artist_id
-                    for artist_id in normalized_artist_ids
-                }
-                for future in as_completed(futures):
-                    artist_id = futures[future]
-                    try:
-                        all_songs_by_artist[artist_id] = future.result(
-                            timeout=self.settings.upstream_timeout_sec * 6
-                        )
-                    except Exception as exc:
-                        self.logger.error("Error building mix songs for artist %s: %s", artist_id, exc)
-                        all_songs_by_artist[artist_id] = []
-
-            result = self._create_balanced_mix(all_songs_by_artist, limit)
+                while targets:
+                    futures = {
+                        executor.submit(self._fetch_artist_songs, artist_id, target): artist_id
+                        for artist_id, target in targets.items()
+                    }
+                    for future in as_completed(futures):
+                        artist_id = futures[future]
+                        try:
+                            songs = future.result()
+                        except Exception as exc:
+                            self.logger.error("Error building mix songs for artist %s: %s", artist_id, exc)
+                            songs = []
+                        if len(songs) < targets[artist_id]:
+                            exhausted_artists.add(artist_id)
+                        combined = {
+                            song["videoId"]: song
+                            for song in all_songs_by_artist[artist_id] + songs
+                        }
+                        all_songs_by_artist[artist_id] = list(combined.values())
+                    result = self._create_balanced_mix(all_songs_by_artist, limit)
+                    if len(result) >= limit:
+                        break
+                    targets = {
+                        artist_id: min(size * 2, limit * 2)
+                        for artist_id, size in requested_sizes.items()
+                        if artist_id not in exhausted_artists and size < limit * 2
+                    }
+                    # If the requested limit cannot represent every artist, only
+                    # try additional artists when the sampled ones leave gaps.
+                    if remaining_artists:
+                        next_count = min(limit - len(result), len(remaining_artists))
+                        for artist_id in remaining_artists[:next_count]:
+                            all_songs_by_artist[artist_id] = []
+                            targets[artist_id] = initial_target
+                        remaining_artists = remaining_artists[next_count:]
+                    requested_sizes.update(targets)
 
             artist_count = defaultdict(int)
             for song in result:
