@@ -340,6 +340,13 @@ def create_app(
     register_request_hooks(app, logger)
     register_error_handlers(app, logger)
 
+    def cached_metadata_response(payload, cache_state, stale_fallback):
+        response = jsonify(enhance_payload_thumbnails(payload))
+        response.headers.update(
+            cache_layer.headers_for_state(cache_state, stale_fallback=stale_fallback)
+        )
+        return response
+
     @app.route("/search", methods=["GET"])
     def search():
         query = request.args.get("query")
@@ -358,8 +365,7 @@ def create_app(
         if not song_id or not isinstance(song_id, str):
             abort(400, description="Song ID is required and must be a string")
         try:
-            details = get_clients().call_ytmusic("get_song", song_id)
-            return jsonify(enhance_payload_thumbnails(details))
+            return cached_metadata_response(*get_hot_service().song(song_id))
         except Exception as exc:
             logger.error("Error fetching song details: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -439,9 +445,9 @@ def create_app(
         if not song_id or not isinstance(song_id, str):
             abort(400, description="Song ID is required and must be a string")
         try:
-            watch_playlist = get_clients().call_ytmusic("get_watch_playlist", song_id)
-            return jsonify(
-                enhance_payload_thumbnails(watch_playlist.get("tracks", []))
+            watch_playlist, cache_state, stale_fallback = get_hot_service().watch_playlist(song_id)
+            return cached_metadata_response(
+                watch_playlist.get("tracks", []), cache_state, stale_fallback
             )
         except Exception as exc:
             logger.error("Error fetching related songs: %s", exc)
@@ -452,8 +458,7 @@ def create_app(
         if not artist_id or not isinstance(artist_id, str):
             abort(400, description="Artist ID is required and must be a string")
         try:
-            details = get_clients().call_ytmusic("get_artist", artist_id)
-            return jsonify(enhance_payload_thumbnails(details))
+            return cached_metadata_response(*get_hot_service().artist(artist_id))
         except Exception as exc:
             logger.error("Error fetching artist details: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -506,8 +511,7 @@ def create_app(
         if not album_id or not isinstance(album_id, str):
             abort(400, description="Album ID is required and must be a string")
         try:
-            details = get_clients().call_ytmusic("get_album", album_id)
-            return jsonify(enhance_payload_thumbnails(details))
+            return cached_metadata_response(*get_hot_service().album(album_id))
         except Exception as exc:
             logger.error("Error fetching album details: %s", exc)
             abort(500, description="An error occurred while processing your request")
@@ -599,9 +603,11 @@ def create_app(
             if not isinstance(artist_id, str) or not artist_id.strip():
                 abort(400, description="All artist IDs must be non-empty strings")
 
+        metadata_service = get_hot_service()
+
         def fetch_artist_info(artist_id):
             try:
-                artist_details = get_clients().call_ytmusic("get_artist", artist_id)
+                artist_details, _, _ = metadata_service.artist(artist_id)
                 high_quality_thumbnail = select_best_thumbnail(
                     artist_details.get("thumbnails", []),
                 )
@@ -624,7 +630,8 @@ def create_app(
         artists_data = []
         with ThreadPoolExecutor(max_workers=settings_obj.max_concurrency_artist_lookup) as executor:
             future_to_artist = {
-                executor.submit(fetch_artist_info, artist_id): artist_id for artist_id in artist_ids
+                executor.submit(fetch_artist_info, artist_id): artist_id
+                for artist_id in dict.fromkeys(artist_ids)
             }
             for future in as_completed(future_to_artist):
                 try:

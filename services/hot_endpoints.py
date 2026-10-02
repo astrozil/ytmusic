@@ -177,7 +177,7 @@ class HotEndpointsService:
             return latest_stale_payload, "stale", True
         return None
 
-    def _with_cache_sync(self, cache_key, fresh_ttl, stale_ttl, fetch_fn):
+    def _with_cache_sync(self, cache_key, fresh_ttl, stale_ttl, fetch_fn, ttl_resolver=None):
         cached = self.cache_layer.get_envelope(cache_key)
         if cached.state == "hit":
             return cached.payload, "hit", False
@@ -219,7 +219,13 @@ class HotEndpointsService:
 
             try:
                 payload = fetch_fn()
-                self.cache_layer.set_envelope(cache_key, payload, fresh_ttl, stale_ttl)
+                effective_fresh, effective_stale = (
+                    ttl_resolver(payload) if ttl_resolver else (fresh_ttl, stale_ttl)
+                )
+                if effective_fresh > 0 and effective_stale > 0:
+                    self.cache_layer.set_envelope(
+                        cache_key, payload, effective_fresh, effective_stale
+                    )
                 return payload, "miss", False
             except Exception as exc:
                 if stale_payload is not None and self.settings.enable_stale_fallback:
@@ -466,21 +472,27 @@ class HotEndpointsService:
         return output, cache_state, stale_fallback
 
     def _with_subcache_sync(self, namespace, key_data, fetch_fn):
+        payload, _, _ = self._with_subcache_result_sync(namespace, key_data, fetch_fn)
+        return payload
+
+    def _with_subcache_result_sync(self, namespace, key_data, fetch_fn):
         cache_key = self._subcache_key(namespace, key_data)
-        payload, _, _ = self._with_cache_sync(
+        return self._with_cache_sync(
             cache_key=cache_key,
             fresh_ttl=self.settings.cache_ttl_subcache_artist_sec,
             stale_ttl=self.settings.cache_stale_subcache_artist_sec,
             fetch_fn=fetch_fn,
         )
-        return payload
 
     def _get_cached_watch_playlist(self, song_id):
+        return self.watch_playlist(song_id)[0]
+
+    def watch_playlist(self, song_id):
         cache_key = self._subcache_key(
             "watch_playlist",
             {"song_id": str(song_id).strip()},
         )
-        payload, _, _ = self._with_cache_sync(
+        return self._with_cache_sync(
             cache_key=cache_key,
             fresh_ttl=self.settings.cache_ttl_subcache_seed_sec,
             stale_ttl=self.settings.cache_stale_subcache_seed_sec,
@@ -490,10 +502,12 @@ class HotEndpointsService:
                 timeout=self.settings.upstream_timeout_sec * 2,
             ),
         )
-        return payload
 
     def _get_cached_artist(self, artist_id):
-        return self._with_subcache_sync(
+        return self.artist(artist_id)[0]
+
+    def artist(self, artist_id):
+        return self._with_subcache_result_sync(
             "artist",
             {"artist_id": str(artist_id).strip()},
             lambda: self.clients.call_ytmusic(
@@ -527,7 +541,10 @@ class HotEndpointsService:
         )
 
     def _get_cached_album(self, album_id):
-        return self._with_subcache_sync(
+        return self.album(album_id)[0]
+
+    def album(self, album_id):
+        return self._with_subcache_result_sync(
             "album",
             {"album_id": str(album_id).strip()},
             lambda: self.clients.call_ytmusic(
@@ -538,11 +555,31 @@ class HotEndpointsService:
         )
 
     def _get_cached_song(self, song_id):
+        return self.song(song_id)[0]
+
+    def _song_cache_ttls(self, payload):
+        fresh_ttl = self.settings.cache_ttl_subcache_song_sec
+        stale_ttl = self.settings.cache_stale_subcache_song_sec
+        streaming_data = payload.get("streamingData") if isinstance(payload, dict) else None
+        if isinstance(streaming_data, dict):
+            try:
+                remaining_seconds = int(streaming_data["expiresInSeconds"])
+            except (KeyError, TypeError, ValueError):
+                return 0, 0
+            # Leave a minute for transit/clock differences and allow for TTL jitter.
+            max_ttl = int((remaining_seconds - 60) / (1 + self.settings.cache_jitter_pct))
+            if max_ttl < 2:
+                return 0, 0
+            fresh_ttl = min(fresh_ttl, max_ttl - 1)
+            stale_ttl = min(stale_ttl, max_ttl)
+        return fresh_ttl, stale_ttl
+
+    def song(self, song_id):
         cache_key = self._subcache_key(
             "song",
             {"song_id": str(song_id).strip()},
         )
-        payload, _, _ = self._with_cache_sync(
+        return self._with_cache_sync(
             cache_key=cache_key,
             fresh_ttl=self.settings.cache_ttl_subcache_song_sec,
             stale_ttl=self.settings.cache_stale_subcache_song_sec,
@@ -551,8 +588,8 @@ class HotEndpointsService:
                 song_id,
                 timeout=self.settings.upstream_timeout_sec * 2,
             ),
+            ttl_resolver=self._song_cache_ttls,
         )
-        return payload
 
     @staticmethod
     def _normalize_artist_name(value):
