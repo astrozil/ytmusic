@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 TARGET_MAX_DIMENSION = 544
 _GOOGLE_SIZE_PATTERN = re.compile(r"w(\d+)-h(\d+)")
+_ATOMIC_TYPES = frozenset({str, int, float, bool, bytes, type(None)})
 
 
 def _safe_int(value, default=0):
@@ -192,38 +193,34 @@ def _enhance_node(node, inherited_video_id=None, target_max_dimension=TARGET_MAX
         ]
 
     if not isinstance(node, dict):
-        return node
+        # JSON scalars are immutable. Preserve isolation for uncommon mutable
+        # values without deep-copying the entire JSON payload first.
+        return node if type(node) in _ATOMIC_TYPES else copy.deepcopy(node)
 
     current_video_id = _resolve_video_id(node, inherited_video_id)
-
-    if "thumbnails" in node:
-        node["thumbnails"] = normalize_thumbnails(
-            thumbnails=node.get("thumbnails"),
-            video_id=current_video_id,
-            target_max_dimension=target_max_dimension,
-        )
-
-    thumbnail_obj = node.get("thumbnail")
-    if isinstance(thumbnail_obj, dict) and "url" in thumbnail_obj:
-        node["thumbnail"] = normalize_single_thumbnail(
-            thumbnail_obj,
-            target_max_dimension=target_max_dimension,
-        )
-
-    for key, value in list(node.items()):
+    enhanced = {}
+    for key, value in node.items():
         if key == "thumbnails":
-            continue
-        if key == "thumbnail" and isinstance(value, dict) and "url" in value and "thumbnails" not in value:
-            continue
-        node[key] = _enhance_node(
-            value,
-            inherited_video_id=current_video_id,
-            target_max_dimension=target_max_dimension,
-        )
-
-    return node
+            enhanced[key] = normalize_thumbnails(
+                thumbnails=value,
+                video_id=current_video_id,
+                target_max_dimension=target_max_dimension,
+            )
+        elif key == "thumbnail" and isinstance(value, dict) and "url" in value:
+            thumbnail = normalize_single_thumbnail(value, target_max_dimension=target_max_dimension)
+            if thumbnail is value:
+                # Invalid single thumbnails are preserved, including their extra
+                # fields, but cannot retain mutable references into the source.
+                thumbnail = (
+                    _enhance_node(value, current_video_id, target_max_dimension)
+                    if "thumbnails" in value else copy.deepcopy(value)
+                )
+            enhanced[key] = thumbnail
+        else:
+            enhanced[key] = _enhance_node(value, current_video_id, target_max_dimension)
+    return enhanced
 
 
 def enhance_payload_thumbnails(payload, target_max_dimension=TARGET_MAX_DIMENSION):
-    copied_payload = copy.deepcopy(payload)
-    return _enhance_node(copied_payload, target_max_dimension=target_max_dimension)
+    """Build an isolated response and normalize thumbnails in one traversal."""
+    return _enhance_node(payload, target_max_dimension=target_max_dimension)

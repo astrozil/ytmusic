@@ -85,6 +85,8 @@ def create_app(
 ):
     settings_obj = settings_obj or Settings.from_env()
     app = Flask(__name__)
+    # Response object-key order has no API meaning; cache keys sort independently.
+    app.json.sort_keys = False
 
     cache_layer = cache_layer_obj or CacheLayer(app, settings_obj, logger)
     clients = clients_obj

@@ -2,6 +2,33 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Response Copying and Serialization Optimization
+
+- Thumbnail formatting now builds an isolated response and normalizes thumbnails
+  in one traversal, removing the full preliminary deep copy. Immutable JSON
+  scalars are reused; dictionaries and lists are rebuilt. Opaque mutable values
+  and invalid single-thumbnail metadata retain deep-copy fallback behavior.
+  Shared source children under different video parents get independent outputs
+  and the correct parent-specific fallback thumbnails.
+- Flask response JSON no longer sorts object keys. Values, array ordering,
+  Unicode encoding, and response shapes remain compatible; object keys follow
+  insertion order. Canonical cache-key hashing still sorts keys independently.
+  Raw cached payloads remain untouched, with no additional encoded-body cache.
+- Validation: 283 tests pass, including mutable isolation, invalid/nested
+  thumbnails, opaque values, concurrent formatting, cold/warm route parity, and
+  canonical cache-key stability. Anonymous local live checks for trending, mix,
+  artist, and song routes returned 200 on cold and warm reads with matching bodies.
+  Real artist/song formatting matched the previous formatter exactly, and raw
+  cache payloads remained unchanged. Render deployment was not inspected.
+- Synthetic formatting plus JSON encoding benchmarks (median of five repeats,
+  30 operations each) improved from 2.020 to 1.326 ms for 50 trending items,
+  8.420 to 5.533 ms for 200 mix items, and 4.759 to 3.097 ms for 100 Billboard
+  items: 1.52-1.54x faster, or about 34-35% less CPU time for that work. These
+  are not end-to-end request latency measurements. Temporary allocation peaks
+  were broadly similar; retained cache memory policy is unchanged.
+- Next optimization: add a repeatable benchmark harness for measuring route
+  latency, concurrency, upstream calls, and cache behavior.
+
 ## 2026-10-02 Lyrics Budgets and Deduplication Optimization
 
 - `/lyrics` delegates lookup and caching to `services/lyrics.py`. Provider order
