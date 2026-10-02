@@ -4,6 +4,8 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import pytest
+
 from cache_layer import CacheLayer, key_for_billboard
 from services.hot_endpoints import HotEndpointsService
 
@@ -195,6 +197,76 @@ def test_trending_limit_capped_to_50_and_cache_normalized(settings_factory):
     assert stale_flag_2 is False
 
 
+@pytest.mark.parametrize("section", ["videos", "daily", "weekly"])
+def test_trending_expands_chart_playlists_and_prefers_trending(settings_factory, section):
+    from flask import Flask
+
+    class PlaylistChartClients(ServiceFakeClients):
+        def __init__(self):
+            super().__init__()
+            self.playlists_requested = []
+
+        def call_ytmusic(self, method_name, *args, **kwargs):
+            if method_name == "get_charts":
+                return {section: [
+                    {"title": "Top 100 Live Performances", "playlistId": "live"},
+                    {"title": "Daily Top Music Videos", "playlistId": "daily"},
+                    {"title": "Trending 20 United States", "playlistId": "trending"},
+                ]}
+            if method_name == "get_playlist":
+                self.playlists_requested.append(args[0])
+                return {"tracks": [None, {"title": "Unavailable"},
+                    {"videoId": "first", "title": "First"},
+                    {"videoId": "second", "title": "Second"},
+                ]}
+            if method_name == "search":
+                return []
+            return super().call_ytmusic(method_name, *args, **kwargs)
+
+    flask_app = Flask(__name__)
+    settings = settings_factory()
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    clients = PlaylistChartClients()
+    service = HotEndpointsService(clients, cache_layer, settings, logger=flask_app.logger)
+
+    payload, state, _ = service.trending("US", "1")
+    assert [track["videoId"] for track in payload] == ["first"]
+    assert clients.playlists_requested == ["trending"]
+    assert state == "miss"
+    payload, _, _ = service.trending("US", "2")
+    assert [track["videoId"] for track in payload] == ["first", "second"]
+    assert clients.playlists_requested == ["trending"]
+
+
+def test_trending_playlist_failure_preserves_stale_tracks(settings_factory):
+    from flask import Flask
+    from cache_layer import key_for_trending
+
+    class FailingPlaylistClients(ServiceFakeClients):
+        def call_ytmusic(self, method_name, *args, **kwargs):
+            if method_name == "get_charts":
+                return {"videos": [{"title": "Trending", "playlistId": "broken"}]}
+            if method_name == "get_playlist":
+                raise RuntimeError("playlist unavailable")
+            return super().call_ytmusic(method_name, *args, **kwargs)
+
+    flask_app = Flask(__name__)
+    settings = settings_factory()
+    cache_layer = CacheLayer(flask_app, settings, logger=flask_app.logger)
+    service = HotEndpointsService(FailingPlaylistClients(), cache_layer, settings, logger=flask_app.logger)
+    stale_tracks = [{"videoId": "cached", "title": "Cached song"}]
+    now = time.time()
+    cache_layer.cache_set_safe(key_for_trending("US", 1), {
+        "payload": stale_tracks, "fetched_at": now - 120,
+        "fresh_until": now - 60, "stale_until": now + 120,
+    }, timeout=120)
+
+    payload, state, stale_flag = service.trending("US", "1")
+    assert payload == stale_tracks
+    assert state == "stale"
+    assert stale_flag is True
+
+
 def test_singleflight_prevents_duplicate_trending_fetches(settings_factory):
     settings = settings_factory()
     from flask import Flask
@@ -294,6 +366,39 @@ def test_distributed_singleflight_async_waits_for_leader_result(settings_factory
     assert payload == {"value": "leader-async"}
     assert state == "hit"
     assert stale_flag is False
+
+
+@pytest.mark.parametrize("include_browse_id", [True, False])
+def test_mix_release_lookup_uses_section_browse_id_and_cache(settings_factory, include_browse_id):
+    from flask import Flask
+
+    class ReleaseClients(ServiceFakeClients):
+        def __init__(self):
+            super().__init__()
+            self.release_calls = []
+
+        def call_ytmusic(self, method_name, *args, **kwargs):
+            if method_name == "get_artist":
+                return {
+                    section: {
+                        "params": section,
+                        **({"browseId": "MPADartist-a"} if include_browse_id else {}),
+                    }
+                    for section in ["albums", "singles"]
+                }
+            if method_name == "get_artist_albums":
+                self.release_calls.append(args)
+            return super().call_ytmusic(method_name, *args, **kwargs)
+
+    settings = settings_factory()
+    app = Flask(__name__)
+    clients = ReleaseClients()
+    layer = CacheLayer(app, settings, logger=app.logger)
+    service = HotEndpointsService(clients, layer, settings, logger=app.logger)
+    assert service._fetch_artist_songs("artist-a")
+    assert service._fetch_artist_songs("artist-a")
+    browse_id = "MPADartist-a" if include_browse_id else "artist-a"
+    assert clients.release_calls == [(browse_id, "albums"), (browse_id, "singles")]
 
 
 def test_recommendations_handles_partial_seed_failures(settings_factory):
@@ -467,7 +572,7 @@ def test_billboard_returns_stale_on_upstream_failure(settings_factory, monkeypat
     def _raise(*args, **kwargs):
         raise RuntimeError("billboard failed")
 
-    monkeypatch.setattr("services.hot_endpoints.billboard.ChartData", _raise)
+    monkeypatch.setattr("services.hot_endpoints.BillboardChart", _raise)
 
     payload, state, stale_flag = asyncio.run(service.billboard())
 

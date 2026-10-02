@@ -2,6 +2,56 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Trending Repair
+
+- Reproduced deployed `get_charts` failure locally with ytmusicapi 1.11.5:
+  `KeyError: 'musicTwoRowItemRenderer'`.
+- Pinned `ytmusicapi==1.12.3` in requirements.txt and updated the local virtual environment.
+- Current chart responses contain playlist cards rather than individual songs.
+  Trending now resolves their tracks through the existing playlist subcache, prefers
+  the playlist with "trending" in its title, and falls back to daily/weekly/other
+  video charts. Legacy direct-track responses remain supported.
+- Failed or empty playlist fetches do not cache playlist cards as songs; upstream
+  failures retain endpoint stale fallback behavior.
+- Validation: 41 tests pass. Live Flask route checks returned HTTP 200 for
+  US limit=50 (19 playable tracks, followed by a cache hit) and SG limit=10
+  (10 playable tracks). The limit is a maximum; chart availability may be smaller.
+- Deployment must rebuild dependencies and restart with the changed source.
+
+## 2026-10-02 Additional Deployment Repairs
+
+- Added `services/billboard_chart.py`, a Billboard compatibility parser that reads
+  labelled LW/PEAK/WEEKS ON CHART statistics. Current desktop/mobile nested cells
+  broke billboard.py's positional parser. Older positional markup remains supported;
+  malformed rows raise so the existing stale fallback can serve cached data.
+- Pinned `billboard.py==7.1.0`, whose fetch and ChartEntry interfaces the adapter uses.
+  Chart fetching now uses configured upstream timeouts and retry count.
+- Mix album/single lookups now use each artist section's browseId (e.g. MPAD...),
+  falling back to the artist ID for older responses. Artist ID plus modern params
+  returned the artist's Top songs shelf instead of releases and caused huge parser errors.
+- The ytmusicapi upgrade also fixes the logged watch-playlist endpoint failure.
+  Live recommendations for the two logged seeds returned HTTP 200 with 50 items.
+- Redis hostname from the deployment logs does not resolve locally either. No
+  credentials or deployed environment were changed. The current Redis Cloud public
+  endpoint is required to repair the deployment's REDIS_URL; it cannot be inferred
+  safely from the invalid hostname. Asked the user for hostname:port only.
+- Cache `/health` now includes configured_backend, degraded and startup_error.
+  SimpleCache remains usable during Redis startup failure, and successful cache
+  operations no longer erase the persistent indication that Redis is unavailable.
+- Redeploy with rebuilt requirements. Set REDIS_URL using the current public
+  endpoint from Redis Cloud, preserve credentials privately, URL-encode the password,
+  and use the provider's required redis:// or rediss:// scheme. Restart and verify
+  `/health` reports backend=redis and degraded=false. If intentionally using only
+  memory caching, set CACHE_BACKEND=simple explicitly.
+- Live mix: HTTP 200 with 5 requested songs, ~14.8s; no release parser failures.
+- Live Billboard: HTTP 200, 100 entries, chart date 2026-10-03; miss ~9.1s and
+  subsequent hit ~14ms. Stats preserved, including rank 1 weeks=49 (not weeks at #1).
+- Lyrics request in the log used artist `Song`. With artist `LANY`, the same title
+  returned HTTP 200 through the existing LRCLIB source. Genius 403 is an upstream
+  access restriction; do not bypass it or invent lyrics when all providers miss.
+- Validation: 53 tests pass, including current/legacy Billboard parsing, malformed
+  data, Redis DNS fallback health, and modern/legacy artist release IDs.
+
 ## Current State Summary
 
 - App is a Flask + Waitress API (`app.py`) with modular services:

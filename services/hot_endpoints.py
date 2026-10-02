@@ -7,7 +7,6 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
-import billboard
 from redis import from_url as redis_from_url
 from redis.exceptions import RedisError
 
@@ -19,6 +18,7 @@ from cache_layer import (
     stable_sha256,
 )
 from services.thumbnail_quality import normalize_thumbnails
+from services.billboard_chart import BillboardChart
 
 
 def format_thumbnails(thumbnails, video_id=None):
@@ -304,7 +304,10 @@ class HotEndpointsService:
 
     def get_trending_video_items(self, charts, limit):
         if isinstance(charts, dict):
-            raw_videos = charts.get("videos", [])
+            raw_videos = next(
+                (charts[key] for key in ("videos", "daily", "weekly") if charts.get(key)),
+                [],
+            )
             if isinstance(raw_videos, dict):
                 items = raw_videos.get("items", [])
             elif isinstance(raw_videos, list):
@@ -316,6 +319,29 @@ class HotEndpointsService:
         else:
             items = []
         valid_items = [item for item in items if isinstance(item, dict)]
+        # Current charts contain playlist cards; older responses contain tracks.
+        playlists = [item for item in valid_items if item.get("playlistId") and not item.get("videoId")]
+        if playlists:
+            def playlist_priority(item):
+                title = str(item.get("title", "")).lower()
+                return next((i for i, token in enumerate(("trending", "daily", "weekly")) if token in title), 3)
+
+            last_error = None
+            for playlist in sorted(playlists, key=playlist_priority):
+                try:
+                    payload = self._get_cached_playlist(playlist["playlistId"])
+                    tracks = [
+                        track for track in payload.get("tracks", [])
+                        if isinstance(track, dict) and track.get("videoId")
+                    ]
+                    if tracks:
+                        return tracks[:limit]
+                except Exception as exc:
+                    last_error = exc
+                    self.logger.warning("Failed to fetch chart playlist %s: %s", playlist["playlistId"], exc)
+            if last_error is not None:
+                raise last_error
+            raise ValueError("Chart playlists returned no playable tracks")
         return valid_items[:limit]
 
     def _extract_artists(self, song_like):
@@ -432,13 +458,13 @@ class HotEndpointsService:
             ),
         )
 
-    def _get_cached_artist_albums(self, artist_id, params):
+    def _get_cached_artist_albums(self, browse_id, params):
         return self._with_subcache_sync(
             "artist_albums",
-            {"artist_id": str(artist_id).strip(), "params": str(params).strip()},
+            {"browse_id": str(browse_id).strip(), "params": str(params).strip()},
             lambda: self.clients.call_ytmusic(
                 "get_artist_albums",
-                artist_id,
+                browse_id,
                 params,
                 timeout=self.settings.upstream_timeout_sec * 2,
             ),
@@ -774,7 +800,8 @@ class HotEndpointsService:
             if not params:
                 continue
             try:
-                releases = self._get_cached_artist_albums(artist_id, params)
+                releases_browse_id = content_data.get("browseId") or artist_id
+                releases = self._get_cached_artist_albums(releases_browse_id, params)
             except Exception as exc:
                 self.logger.error("Error fetching %s for artist %s: %s", content_type, artist_id, exc)
                 continue
@@ -972,7 +999,10 @@ class HotEndpointsService:
         cache_key = key_for_billboard(week_key)
 
         async def fetch():
-            chart = await asyncio.to_thread(billboard.ChartData, "hot-100")
+            chart = await asyncio.to_thread(
+                BillboardChart, "hot-100", timeout=self.settings.upstream_timeout_sec * 2,
+                max_retries=self.settings.upstream_retry_attempts,
+            )
             chart_entries = list(chart)
             billboard_sem = asyncio.Semaphore(self.settings.max_concurrency_billboard)
             artist_sem = asyncio.Semaphore(self.settings.max_concurrency_artist_lookup)

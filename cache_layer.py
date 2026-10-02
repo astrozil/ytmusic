@@ -77,6 +77,9 @@ class CacheLayer:
     def _initialize_cache(self, flask_app):
         cache_status = {
             "backend": self.settings.cache_backend,
+            "configured_backend": self.settings.cache_backend,
+            "degraded": False,
+            "startup_error": None,
             "mode": "fail_open" if self.settings.cache_fail_open else "fail_closed",
             "healthy": True,
             "last_error": None,
@@ -111,6 +114,7 @@ class CacheLayer:
         except (RedisError, OSError, socket.gaierror, ValueError) as exc:
             cache_status["healthy"] = False
             cache_status["last_error"] = f"Redis startup check failed: {exc}"
+            cache_status["startup_error"] = cache_status["last_error"]
 
             if not self.settings.cache_fail_open:
                 raise RuntimeError(
@@ -121,6 +125,7 @@ class CacheLayer:
                 "Redis startup check failed (%s). Falling back to SimpleCache.", exc
             )
             cache_status["backend"] = "simple"
+            cache_status["degraded"] = True
             cache_status["healthy"] = True
             flask_app.config.update(self._cache_config("SimpleCache"))
             cache_instance = Cache(flask_app)
@@ -235,6 +240,9 @@ class CacheLayer:
     def health_snapshot(self):
         return {
             "backend": self.status["backend"],
+            "configured_backend": self.status["configured_backend"],
+            "degraded": self.status["degraded"],
+            "startup_error": self.status["startup_error"],
             "mode": self.status["mode"],
             "healthy": self.status["healthy"],
             "last_error": self.status["last_error"],

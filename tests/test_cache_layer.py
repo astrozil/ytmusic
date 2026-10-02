@@ -1,4 +1,5 @@
 import time
+import socket
 
 from flask import Flask
 
@@ -70,3 +71,31 @@ def test_cache_key_determinism_for_reordered_ids():
         ["artist1", "artist2"],
         50,
     )
+
+
+def test_redis_dns_failure_remains_visible_after_memory_cache_success(settings_factory, monkeypatch):
+    app = Flask(__name__)
+    settings = settings_factory(CACHE_BACKEND="redis")
+
+    def unavailable_redis(*args, **kwargs):
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr("cache_layer.redis_from_url", unavailable_redis)
+    layer = CacheLayer(app, settings, logger=app.logger)
+    assert layer.cache_set_safe("test:fallback", {"value": 1})
+    assert layer.cache_get_safe("test:fallback") == {"value": 1}
+    health = layer.health_snapshot()
+    assert health["backend"] == "simple"
+    assert health["configured_backend"] == "redis"
+    assert health["healthy"] is True
+    assert health["degraded"] is True
+    assert "Name or service not known" in health["startup_error"]
+
+
+def test_explicit_simple_cache_is_not_degraded(settings_factory):
+    app = Flask(__name__)
+    layer = CacheLayer(app, settings_factory(), logger=app.logger)
+    health = layer.health_snapshot()
+    assert health["configured_backend"] == health["backend"] == "simple"
+    assert health["degraded"] is False
+    assert health["startup_error"] is None

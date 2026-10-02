@@ -1,9 +1,9 @@
 flask[async]
-ytmusicapi
+ytmusicapi==1.12.3
 beautifulsoup4
 flask_caching
 flask_limiter
-billboard.py
+billboard.py==7.1.0
 waitress
 redis
 pytest
