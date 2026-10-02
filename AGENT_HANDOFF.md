@@ -2,6 +2,43 @@
 
 This file captures the major context and decisions from the recent multi-step refactor so future agents can continue work without re-discovery.
 
+## 2026-10-02 Repeatable Performance Benchmark Harness
+
+- Added `python -B -m benchmarks.run`, with usage and measurement definitions in
+  `benchmarks/README.md`. Twelve routes cover trending, mix, Billboard, song,
+  artist, album, artist songs, song batches, recommendations, lyrics, artist
+  batches, and related tracks. Each runs separately cleared sequential cold
+  requests, primed warm requests, and barrier-started groups of simultaneous
+  cold requests to the same key. Cache resets include shared subcaches.
+- Synthetic SDK and HTTP fixtures exercise the real route/service/cache paths,
+  thumbnail/JSON formatting, Billboard parser, lyrics provider handling, batch
+  workers, and actual upstream executor/admission limits. SDK construction is
+  replaced, authentication is disabled, and unexpected Requests network calls
+  fail closed. Deployment environment variables are restored after isolated
+  settings construction; prewarming, rate limiting, Redis, and jitter are off.
+  Executors/sessions and per-run prewarm registrations are cleaned up on failure.
+- JSON reports contain latency percentiles, throughput, status/payload failures,
+  response sizes, cache headers/counter deltas, sampled serialized cache bytes,
+  synchronized upstream attempt counts/peak active work, and workload/runtime/
+  dependency/settings/Git metadata. Reports omit credentials and response bodies.
+  `--baseline` compares matching versions, routes, settings, workload, and runtime,
+  rejecting failed or incompatible reports. Exit codes distinguish measured
+  failures (1) from invalid inputs/setup/comparison failures (2).
+- These are offline local WSGI measurements, not deployed HTTP/Waitress latency.
+  Simulated upstream delays omit provider variability/retries. Cache bytes are
+  retained serialized content, not RSS; existing internal cache counters may be
+  approximate under concurrency. Response validation is outside latency timing,
+  but included in throughput; clears, priming, and snapshots are excluded.
+- Validation: 298 tests pass. Fifteen harness tests cover all routes/phases,
+  cold resets, warm reuse, concurrent fetch sharing, bounded upstream activity,
+  environment/network isolation, partial failures, worker cleanup, percentiles,
+  JSON baseline round trips, incompatible comparisons, and CLI exit status.
+  Two standalone default runs each measured 384 responses across 36 scenarios
+  with zero failures, zero upstream calls in every warm phase, and identical
+  method/provider counts between runs. Each four-request cold group used the
+  same upstream work as one cold request. Saved-report CLI comparison succeeded;
+  timing differences between unchanged runs are noise, not optimization gains.
+
 ## 2026-10-02 Response Copying and Serialization Optimization
 
 - Thumbnail formatting now builds an isolated response and normalizes thumbnails
